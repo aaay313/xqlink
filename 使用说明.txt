@@ -1,0 +1,64 @@
+xqlink - 中国象棋学习助手（修改版）
+========================================
+
+本程序由 aaay313 打包，基于 atopx/chessboard 修改。
+项目主页：https://github.com/aaay313/xqlink
+原项目：  https://github.com/atopx/chessboard （Apache-2.0）
+
+
+一、怎么用
+----------------------------------------
+把整个文件夹解压到任意位置（例如 D:\xqlink），双击 xqlink.exe 即可。
+不需要安装，不需要管理员权限。
+
+
+二、文件夹结构（不要改动）
+----------------------------------------
+xqlink\
+├── xqlink.exe                          主程序
+├── onnxruntime.dll                     ONNX 推理运行时
+├── onnxruntime_providers_shared.dll    推理 provider 共享库
+├── WebView2Loader.dll                  界面渲染引导库
+└── _up_\libs\pikafish\
+        ├── pikafish-windows.exe         象棋引擎
+        └── pikafish.nnue                引擎神经网络权重
+
+注意：_up_\libs\pikafish\ 这个层级关系不能改，
+      程序靠相对路径找引擎和权重文件。
+
+
+三、系统要求
+----------------------------------------
+1. 64 位 Windows 10 / 11
+2. WebView2 运行时
+   - Win11 和新版 Win10 一般自带
+   - 若启动后白屏，去微软官网下载安装 "WebView2 Evergreen Runtime"
+     https://developer.microsoft.com/microsoft-edge/webview2/
+3. 不需要装 Rust / Node / Python
+
+
+四、首次启动注意事项
+----------------------------------------
+1. SmartScreen 拦截
+   本程序未做数字签名，Windows 会拦截。点"更多信息"→"仍要运行"。
+
+2. 杀毒软件报警
+   程序需要抓取屏幕画面来识别棋盘，可能被误报。加白名单即可。
+   这是它的正常工作方式，不会修改任何系统设置。
+
+3. 使用前请先打开象棋对战页面，再在程序里选择要识别的窗口。
+
+
+五、校验文件完整性
+----------------------------------------
+下载后可用 md5.txt 里的值核对各文件是否完整：
+
+  在 PowerShell 里执行：
+  Get-FileHash xqlink.exe -Algorithm MD5
+
+  对比 md5.txt 中记录的哈希值。
+
+
+六、反馈
+----------------------------------------
+问题反馈：https://github.com/aaay313/xqlink/issues

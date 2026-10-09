@@ -105,6 +105,11 @@ jobs:
           Copy-Item "libs/pikafish/pikafish-windows.exe" "$out/_up_/libs/pikafish/pikafish-windows.exe"
           Copy-Item "libs/pikafish/pikafish.nnue"        "$out/_up_/libs/pikafish/pikafish.nnue"
 
+          # 附上中文使用说明，方便收到包的人直接看
+          if (Test-Path "使用说明.txt") {
+            Copy-Item "使用说明.txt" "$out/使用说明.txt"
+          }
+
           Get-ChildItem $out -Recurse -File | ForEach-Object {
             Write-Host ("{0,12:N0}  {1}" -f $_.Length, $_.FullName)
           }
