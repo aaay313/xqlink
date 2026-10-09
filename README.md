@@ -1,6 +1,20 @@
 # 中国象棋学习助手 🚩
 
-感兴趣的小伙伴请点击右上角`star`收藏
+> 本仓库是 [atopx/chessboard](https://github.com/atopx/chessboard) 的修改版，
+> 由 [aaay313](https://github.com/aaay313) 在原项目基础上持续完善。
+> 原项目基于 Apache-2.0 许可证，永久免费开源，仅供学习与研究使用。
+
+## 修改版说明
+
+本版本在原项目基础上做了以下改进：
+
+- **轮次同步修复**：统一状态机语义，新增盘面反推走子方的自愈机制，解决「对方已行棋但仍显示等待」的问题
+- **识别稳定性**：加入棋子数量规则纠错 + 棋格级多帧投票，消除「平炮时出现两个炮」这类误判
+- **性能优化**：图像指纹短路跳过重复推理，主循环节奏扣减，CHW 扁平缓冲预处理
+- **健壮性**：消除引擎交互层的 panic 隐患
+- **界面对齐**：深色主题、胜率进度条、状态标签、构建标识、窗口可缩放、复制 FEN
+- **棋谱与复盘**：自动记录中文棋谱、导出对局、复盘评分、棋谱回放、绝杀提示
+- **动画提速**：支招提示动画由 1.5s 缩短至 0.75s
 
 ## 项目简介
 
@@ -86,3 +100,11 @@ B站：[https://www.bilibili.com/video/BV1TQVBzuE7C?t=3.4](https://www.bilibili.
 1. 本项目基于 Apache-2.0 许可证（[LICENSE](./LICENSE)），永久免费开源，仅供学习与研究使用。
 2. 严禁任何商业化或非法用途。
 3. 使用本工具时，请遵守各平台用户协议，本工具不涉及任何破解或自动化操作。
+
+## 🙏 致谢
+
+- 原项目：[atopx/chessboard](https://github.com/atopx/chessboard)（Apache-2.0）
+- 引擎：[Pikafish](https://github.com/official-pikafish/Pikafish) 中国象棋引擎
+- 推理：ONNX Runtime、YOLOv8 棋子检测模型
+
+本修改版由 [aaay313](https://github.com/aaay313) 维护，保留了原项目的全部版权声明与署名。
