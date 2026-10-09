@@ -1,13 +1,13 @@
 pub mod chessdb;
 use std::fmt::Display;
 use std::io::BufRead;
-use std::io::BufReader;
 use std::io::Write;
 use std::path::Path;
 mod command;
 
 use tracing::debug;
 use tracing::trace;
+use tracing::warn;
 
 #[derive(Debug, serde::Serialize, Default, Clone)]
 pub struct QueryResult {
@@ -18,6 +18,7 @@ pub struct QueryResult {
     pub moves: Vec<String>, // 思考(chinese)
     pub state: QueryState,  // 状态
     pub source: String,     // 来源
+    pub our_turn: bool,     // 是否轮到我方行棋（前端据此决定是否显示建议）
 }
 
 const SOURCE_ENGINE: &str = "引擎";
@@ -59,12 +60,11 @@ unsafe impl Sync for Engine {}
 
 impl Engine {
     pub fn new(libs: &Path) -> Self {
-        let mut child = command::new(libs);
-
         let nnue = libs.join("pikafish.nnue");
 
-        let stdin = Box::new(child.stdin.take().unwrap());
-        let stdout = Box::new(BufReader::new(child.stdout.take().unwrap()));
+        // command::new 直接返回父进程侧的管道两端。
+        // Windows 下不走 Stdio::piped()，原因见 command.rs 顶部注释。
+        let (child, (stdin, stdout)) = command::new(libs);
 
         let mut eng = Engine { stdin, stdout, child };
         eng.setoption("EvalFile", nnue.display());
@@ -73,8 +73,10 @@ impl Engine {
     }
 
     pub fn reload(&mut self, libs: &Path, config: &EngineConfig) {
-        self.child.kill().unwrap();
-        self.child.wait().unwrap();
+        // 引擎可能已经自行退出（崩溃、被系统回收），此时 kill 会返回错误。
+        // 忽略它 —— 后面反正要重建一个新引擎。
+        let _ = self.child.kill();
+        let _ = self.child.wait();
         *self = Self::new(libs);
         self.set_hash(config.hash);
         self.set_show_wdl(config.show_wdl);
@@ -82,8 +84,13 @@ impl Engine {
     }
 
     fn write_command<A: Display>(&mut self, args: A) {
-        writeln!(self.stdin, "{}", args).expect("write command error");
-        self.stdin.flush().expect("write command flush error");
+        // 引擎退出后管道会断开，写入失败只记日志，不该让监听线程崩溃
+        if let Err(err) = writeln!(self.stdin, "{}", args) {
+            warn!("向引擎写入命令失败（引擎可能已退出）: {err}");
+        }
+        if let Err(err) = self.stdin.flush() {
+            warn!("刷新引擎输入缓冲失败: {err}");
+        }
         debug!("{}", args);
     }
 
@@ -99,11 +106,20 @@ impl Engine {
 
     pub fn position(&mut self, fen: &str) { self.write_command(format!("position fen {}", fen)) }
 
-    fn read_line(&mut self) -> String {
+    fn read_line(&mut self) -> Option<String> {
         let mut line = String::new();
-        self.stdout.read_line(&mut line).unwrap();
-        trace!("line::{}", line);
-        line.trim().to_string()
+        match self.stdout.read_line(&mut line) {
+            // 读到 0 字节即 EOF：引擎进程已经退出
+            Ok(0) => None,
+            Ok(_) => {
+                trace!("line::{}", line);
+                Some(line.trim().to_string())
+            }
+            Err(err) => {
+                warn!("读取引擎输出失败（引擎可能已退出）: {err}");
+                None
+            }
+        }
     }
 
     fn parse_line(&self, line: String, result: &mut QueryResult) {
@@ -147,7 +163,12 @@ impl Engine {
         self.write_command(format!("go depth {} movetime {}", depth, time));
         let mut pre_line = String::new();
         loop {
-            let line = self.read_line();
+            // 引擎中途退出时立刻放弃等待。
+            // 原实现在读失败时 unwrap panic，若改成返回空串又会在这里无限空转。
+            let Some(line) = self.read_line() else {
+                warn!("引擎输出中断，放弃等待 bestmove");
+                break;
+            };
             if line.starts_with("bestmove") {
                 trace!("{}", pre_line);
                 break;

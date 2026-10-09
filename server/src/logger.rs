@@ -23,6 +23,21 @@ fn log_dir(home_dir: &Path) -> PathBuf { home_dir.join(".local").join("share").j
 
 static APPENDER_GUARD: OnceLock<Mutex<Option<tracing_appender::non_blocking::WorkerGuard>>> = OnceLock::new();
 
+/// 把配置项 `loglevel` 解析为 tracing 级别，默认 INFO。
+///
+/// 说明: 原实现完全忽略 config.loglevel，固定使用 DEBUG，导致识别主循环
+/// 每 ~0.6s 就写一次日志(实测 30 分钟 1359 条 DEBUG)，带来持续的磁盘 I/O 开销。
+pub fn parse_level(s: &str) -> Level {
+    match s.trim().to_ascii_uppercase().as_str() {
+        "TRACE" => Level::TRACE,
+        "DEBUG" => Level::DEBUG,
+        "INFO" => Level::INFO,
+        "WARN" | "WARNING" => Level::WARN,
+        "ERROR" | "SILENT" => Level::ERROR,
+        _ => Level::INFO,
+    }
+}
+
 /// 初始化tracing库，设置全局订阅者
 pub fn init_tracer(level: Level, home_dir: &std::path::Path) {
     // 创建环境过滤器

@@ -7,7 +7,6 @@ use ort::inputs;
 use ort::session::builder::GraphOptimizationLevel;
 use xcap::image::imageops::FilterType;
 use xcap::image::DynamicImage;
-use xcap::image::GenericImageView;
 use xcap::image::ImageBuffer;
 use xcap::image::Rgba;
 
@@ -55,13 +54,24 @@ pub fn session() -> &'static ort::session::Session {
 pub fn predict(origin_img: ImageBuffer<Rgba<u8>, Vec<u8>>) -> ort::Result<Vec<Detection>> {
     let img =
         DynamicImage::from(origin_img).resize_exact(IMAGE_WIDTH as u32, IMAGE_HEIGHT as u32, FilterType::Triangle);
-    let mut input = Array::zeros((1, 3, IMAGE_WIDTH, IMAGE_HEIGHT));
-    for (x, y, pixel) in img.pixels() {
-        let [r, g, b, _] = pixel.0;
-        input[[0, 0, y as usize, x as usize]] = r as f32 / 255.0;
-        input[[0, 1, y as usize, x as usize]] = g as f32 / 255.0;
-        input[[0, 2, y as usize, x as usize]] = b as f32 / 255.0;
+
+    // 按 CHW 顺序一次性写入扁平缓冲区。
+    //
+    // 原实现用 input[[0, c, y, x]] 逐像素赋值：每写一个元素都要做一次多维下标
+    // 计算与边界检查，640×640×3 ≈ 123 万次，是预处理里最贵的一环。
+    // 改成顺序写入后，编译器可以把整段循环优化成无分支的连续写。
+    // 数值结果与原实现完全一致（输出张量形状不变）。
+    let plane = IMAGE_WIDTH * IMAGE_HEIGHT;
+    let mut buffer = vec![0f32; 3 * plane];
+    let raw = img.as_rgba8().expect("resize_exact 不改变图像类型").as_raw();
+    for (i, px) in raw.chunks_exact(4).enumerate() {
+        buffer[i] = px[0] as f32 / 255.0;
+        buffer[plane + i] = px[1] as f32 / 255.0;
+        buffer[2 * plane + i] = px[2] as f32 / 255.0;
     }
+    let input = Array::from_shape_vec((1, 3, IMAGE_WIDTH, IMAGE_HEIGHT), buffer)
+        .expect("缓冲区长度与形状必然匹配");
+
     let outputs = session().run(inputs!["images" => input.view()]?)?;
     let output = outputs["output"].try_extract_tensor::<f32>()?.view().t().slice(s![.., .., 0]).t().to_owned();
 

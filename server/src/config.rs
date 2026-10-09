@@ -102,7 +102,9 @@ pub async fn set_engine_depth(depth: usize) {
 pub async fn set_engine_time(time: f32) {
     let state = SHARED_STATE.get().unwrap();
     let mut config = state.config.write().unwrap();
-    config.engine.time = (time * 1000.0) as usize;
+    // 前端 Toolbar.vue 传来的是毫秒(秒 × 1000)，此处不可再乘 1000。
+    // 原实现多乘了一次，界面上设 1 秒会写成 1_000_000 ms，等于把时间限制取消。
+    config.engine.time = time.max(0.0) as usize;
     config.save();
     debug!("set_engine_time: {}", time);
 }

@@ -6307,6 +6307,7 @@ dependencies = [
 name = "xqlink"
 version = "0.1.2"
 dependencies = [
+ "indexmap 1.9.3",
  "ndarray",
  "ort",
  "reqwest",

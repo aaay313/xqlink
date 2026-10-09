@@ -2,7 +2,7 @@
 name = "xqlink"
 version = "0.1.2"
 description = "A Tauri App"
-authors = ["atopx <3940422@qq.com>"]
+authors = ["atopx <3940422@qq.com>", "aaay313"]
 edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -16,6 +16,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2.2.0", features = [] }
+# 见下方 [dependencies] 中的说明。schemars 是通过 tauri-build 进入 build 依赖图的，
+# 而 resolver v3(edition 2024) 不跨 normal/build 上下文统一 feature，
+# 因此 build 上下文也必须单独开启 indexmap 的 std。
+indexmap = { version = "1.9", features = ["std"] }
 
 [dependencies]
 tauri = { version = "2.5.1", features = [] }
@@ -32,6 +36,14 @@ tokio = { version = "1.44", default-features = false, features = [
     "macros",
     "rt-multi-thread",
 ] }
+
+# --- 本机编译环境适配（不改变任何功能）---
+# indexmap 1.9.3 的 [features] 中没有 default = ["std"]，其 build.rs 在未开启 std
+# 时会退回用 autocfg 探测 sysroot，本机探测失败（"autocfg could not probe for `std`"），
+# 导致 has_std cfg 缺失、IndexMap<K,V,S> 失去默认泛型，进而让 schemars 0.8.22 编译失败
+# （error[E0107]: struct takes 3 generic arguments but 2 generic arguments were supplied）。
+# 显式开启 std 后 build.rs 直接走 CARGO_FEATURE_STD 分支，不再探测。
+indexmap = { version = "1.9", features = ["std"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 ort = { version = "=2.0.0-rc.9", default-features = false, features = ["ndarray", "load-dynamic"] }

@@ -33,7 +33,7 @@ pub enum BoardChangeState {
     Unknown,
 }
 
-#[derive(Debug, PartialEq, Eq, Default, Clone, Serialize)]
+#[derive(Debug, PartialEq, Eq, Default, Clone, Copy, Serialize)]
 pub enum Camp {
     #[default]
     None,
@@ -108,6 +108,8 @@ impl Changed {
 pub fn board_diff(old_board: [[char; 9]; 10], board: [[char; 9]; 10]) -> (Changed, BoardChangeState) {
     let mut changed = Changed::default();
     let mut count = 0;
+    // 终点格上新出现的棋子，用于校验走子前后棋子身份是否一致
+    let mut to_piece = ' ';
     for y in 0..10 {
         for x in 0..9 {
             if old_board[y][x] != board[y][x] {
@@ -118,7 +120,10 @@ pub fn board_diff(old_board: [[char; 9]; 10], board: [[char; 9]; 10]) -> (Change
                         changed.from = BOARD_MAP[y][x].to_string();
                         changed.camp = Camp::from_piece(changed.piece);
                     }
-                    _ => changed.to = BOARD_MAP[y][x].to_string(),
+                    _ => {
+                        changed.to = BOARD_MAP[y][x].to_string();
+                        to_piece = board[y][x];
+                    }
                 }
             }
         }
@@ -127,7 +132,11 @@ pub fn board_diff(old_board: [[char; 9]; 10], board: [[char; 9]; 10]) -> (Change
     match count {
         1 => (changed, BoardChangeState::One),
         2 => {
-            if changed.from.is_empty() || changed.to.is_empty() {
+            // 起点与终点必须都存在，且"离开起点的棋子"要与"落到终点的棋子"是同一枚
+            // （同类型同颜色）。否则说明这一帧识别自相矛盾 —— 典型情况是某一格被误判
+            // 成别的棋子（例如兵被认成炮），此时若当成一步棋推给界面，就会在棋盘上
+            // 凭空多出一个棋子。这种帧一律降级为 One，走"无效变化"的复位流程。
+            if changed.from.is_empty() || changed.to.is_empty() || changed.piece != to_piece {
                 (changed, BoardChangeState::One)
             } else {
                 (changed, BoardChangeState::Move)
