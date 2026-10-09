@@ -1,0 +1,139 @@
+name: Release
+
+# 触发方式：
+#   1. 打 tag（如 v0.1.2）→ 自动构建 + 创建 Release 并上传绿色版 zip
+#   2. 手动触发（Actions 页面点 Run workflow）→ 只构建，产物存为 artifact
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows (CPU)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server -> target
+
+      # ---------------------------------------------------------------
+      # 资源自检
+      #
+      # 构建需要下面这些"大文件"，它们曾因 .gitignore 的通配规则被排除，
+      # 现在已在 .gitignore 里用否定规则显式放行并提交进仓库：
+      #   libs/large.onnx                     28 MB  棋子检测模型（include_bytes! 编译期嵌入）
+      #   libs/pikafish/pikafish-windows.exe  1.4 MB 引擎本体（运行时资源）
+      #   libs/pikafish/pikafish.nnue         45 MB  引擎权重（运行时资源）
+      #   libs/windows-cpu/*.dll              12 MB  ONNX Runtime + WebView2 运行时
+      #
+      # 这里做一次存在性检查，缺任何一个就明确报错退出，
+      # 避免构建出"能编译但跑不起来"的包。
+      # ---------------------------------------------------------------
+      - name: Verify large assets
+        shell: pwsh
+        run: |
+          $required = @(
+            "libs/large.onnx",
+            "libs/pikafish/pikafish-windows.exe",
+            "libs/pikafish/pikafish.nnue",
+            "libs/windows-cpu/onnxruntime.dll",
+            "libs/windows-cpu/onnxruntime_providers_shared.dll",
+            "libs/windows-cpu/WebView2Loader.dll"
+          )
+          $missing = @()
+          foreach ($f in $required) {
+            if (Test-Path $f) {
+              Write-Host "OK      $f"
+            } else {
+              Write-Host "MISSING $f" -ForegroundColor Yellow
+              $missing += $f
+            }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Host ""
+            Write-Host "以下文件在仓库中缺失，无法产出可用的绿色包：" -ForegroundColor Red
+            $missing | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
+            Write-Host ""
+            Write-Host "请参考 workflow 注释里的说明补齐这些文件后再构建。" -ForegroundColor Yellow
+            exit 1
+          }
+          Write-Host "全部资源就绪" -ForegroundColor Green
+
+      - name: Install frontend deps
+        run: npm ci --ignore-scripts
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Build Tauri (no bundle)
+        run: npx tauri build --config server/tauri.windows.cpu.build.json --no-bundle
+
+      - name: Assemble portable package
+        shell: pwsh
+        run: |
+          $exe    = "server/target/release/xqlink.exe"
+          if (-not (Test-Path $exe)) { throw "xqlink.exe not found" }
+
+          $out = "dist-portable"
+          New-Item -ItemType Directory -Path "$out/_up_/libs/pikafish" -Force | Out-Null
+
+          Copy-Item $exe "$out/xqlink.exe"
+          Copy-Item "libs/windows-cpu/onnxruntime.dll"                 "$out/onnxruntime.dll"
+          Copy-Item "libs/windows-cpu/onnxruntime_providers_shared.dll" "$out/onnxruntime_providers_shared.dll"
+          Copy-Item "libs/windows-cpu/WebView2Loader.dll"               "$out/WebView2Loader.dll"
+          Copy-Item "libs/pikafish/pikafish-windows.exe" "$out/_up_/libs/pikafish/pikafish-windows.exe"
+          Copy-Item "libs/pikafish/pikafish.nnue"        "$out/_up_/libs/pikafish/pikafish.nnue"
+
+          Get-ChildItem $out -Recurse -File | ForEach-Object {
+            Write-Host ("{0,12:N0}  {1}" -f $_.Length, $_.FullName)
+          }
+
+          # 记录校验值，方便下载后核对
+          Get-ChildItem $out -Recurse -File | ForEach-Object {
+            $h = (Get-FileHash $_.FullName -Algorithm MD5).Hash.ToLower()
+            $rel = $_.FullName.Substring((Resolve-Path $out).Path.Length + 1)
+            "$h  $rel"
+          } | Set-Content "$out/md5.txt"
+
+          Compress-Archive -Path "$out/*" -DestinationPath "xqlink-portable.zip" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xqlink-portable-windows
+          path: |
+            xqlink-portable.zip
+            dist-portable/md5.txt
+          retention-days: 30
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            xqlink-portable.zip
+            dist-portable/md5.txt
+          generate_release_notes: true
+          draft: false
+          prerelease: false

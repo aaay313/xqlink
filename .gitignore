@@ -29,4 +29,12 @@ dist-ssr
 *.so
 *.dylib
 __pycache__
-!pikafish-windows.exe
+
+# --- 构建与运行时必需的大文件，显式放行 ---
+# 这些文件被上面的通配规则误伤过，缺任意一个都会导致
+# "能编译但跑不起来"。CI 依赖它们产出完整绿色包。
+!libs/pikafish/pikafish-windows.exe
+!libs/pikafish/pikafish.nnue
+!libs/large.onnx
+!libs/rotate.onnx
+!libs/windows-cpu/*.dll
