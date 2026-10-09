@@ -17,6 +17,8 @@
     text-decoration: none;
     display: block;
     text-decoration-style: solid;
+    /* 深色主题下把木色棋盘从背景里托起来，成为视觉焦点 */
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.6);
 }
 
 .piece-wrap {
@@ -159,4 +161,52 @@
 .piece-r {
     background-image: url("/src/assets/images/piece.png");
     background-position-y: 360px;
+}
+
+/* 走子动画：终点格的棋子从起点偏移处滑回原位（仿 JJ象棋）。
+   用格内过渡而不是独立悬浮层，动画期间不会出现两个棋子。 */
+.piece.move-slide {
+    z-index: 5;
+    will-change: transform;
+    transition: transform 170ms cubic-bezier(0.22, 0.61, 0.36, 1);
+    filter: drop-shadow(0 3px 5px rgba(0, 0, 0, 0.45));
+}
+
+/* 支招演示：起点格的真实棋子**循环**滑向目标格，带蓝色发光以便一眼看到推荐走法。
+   位移量由组件通过 CSS 变量 --hx / --hy 注入。
+
+   滑到终点后**不回滑**：一轮结束时直接复位（70.01% 处无过渡跳回），
+   所以整轮运动只有"走过去"这一个方向，看不到往回走的反向动作。 */
+.piece.hint-move {
+    z-index: 6;
+    will-change: transform;
+    /* 一轮 0.75s：滑动 0.2s → 停目标格 0.35s → 复位 → 停起点 0.2s */
+    animation: hint-move 0.75s infinite;
+    filter: drop-shadow(0 0 6px rgba(30, 144, 255, 0.95)) drop-shadow(0 2px 4px rgba(0, 0, 0, 0.4));
+}
+
+@keyframes hint-move {
+    0% {
+        transform: translate(0, 0);
+        animation-timing-function: cubic-bezier(0.35, 0, 0.2, 1);
+    }
+
+    /* 滑到目标格（约 0.2s） */
+    27% {
+        transform: translate(var(--hx, 0px), var(--hy, 0px));
+    }
+
+    /* 在目标格停留（约 0.35s） */
+    73% {
+        transform: translate(var(--hx, 0px), var(--hy, 0px));
+    }
+
+    /* 无过渡复位到起点，避免出现"滑回去"的反向动画 */
+    73.01% {
+        transform: translate(0, 0);
+    }
+
+    100% {
+        transform: translate(0, 0);
+    }
 }
