@@ -1,0 +1,5 @@
+# 本机无管理员权限，无法安装 MSVC 工具链，改用 x86_64-pc-windows-gnu。
+# GCC 16 已把 libgcc_eh 合并进 libgcc，导致外部 -lgcc_eh 找不到；
+# 开启 self-contained 后使用 Rust 自带的 mingw 库（含 libgcc_eh.a），链接通过。
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-self-contained=yes"]
