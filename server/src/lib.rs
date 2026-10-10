@@ -11,6 +11,7 @@ mod chess;
 mod common;
 mod config;
 mod engine;
+mod knife;
 mod listen;
 mod logger;
 mod worker;
@@ -70,6 +71,9 @@ pub fn run() {
             config::set_engine_time,
             config::set_engine_threads,
             config::set_engine_hash,
+            config::set_engine_strength,
+            config::set_engine_style,
+            config::set_flying_knife,
             config::set_chessdb,
         ])
         .run(tauri::generate_context!())
@@ -80,7 +84,7 @@ pub fn run() {
 fn reload_engine(app: tauri::AppHandle) {
     let lib_path = app.path().resolve("../libs/pikafish", tauri::path::BaseDirectory::Resource).unwrap();
     let state = SHARED_STATE.get().unwrap();
-    let engine_config = state.config.read().unwrap().engine;
+    let engine_config = state.config.read().unwrap().engine.clone();
     state.engine.lock().unwrap().reload(&lib_path, &engine_config);
 }
 

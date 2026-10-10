@@ -173,6 +173,49 @@ pub fn board_move(board: [[char; 9]; 10], iccs: &str) -> [[char; 9]; 10] {
     new_board
 }
 
+/// 子力价值（用于进攻性评估）。将/帅给一个远大于其他棋子的值。
+pub fn piece_value(piece: char) -> i32 {
+    match piece {
+        'K' | 'k' => 10_000,
+        'R' | 'r' => 900,
+        'C' | 'c' => 450,
+        'N' | 'n' => 400,
+        'B' | 'b' => 200,
+        'A' | 'a' => 200,
+        'P' | 'p' => 100,
+        _ => 0,
+    }
+}
+
+/// 评估一步棋的「进攻性」：吃子价值 + 前压程度。
+///
+/// 用于「进攻/防守」风格下对多个候选着法重排：
+/// - 吃子（目标格有对方棋子）给子力价值加分，是最直接的进攻信号；
+/// - 子力前压（越过河界进入对方半场）给小幅加分。
+///
+/// 返回值越大表示这步棋越激进。
+pub fn move_attack_score(board: [[char; 9]; 10], iccs: &str) -> i32 {
+    let mv = Move::new(iccs);
+    let moving = board[mv.from_y][mv.from_x];
+    let target = board[mv.to_y][mv.to_x];
+
+    let mut score = 0;
+    // 1. 吃子：目标格有对方棋子
+    if target != ' ' && Camp::from_piece(target) != Camp::from_piece(moving) {
+        score += piece_value(target);
+    }
+    // 2. 前压：红方越接近对方底线（y 越小）越深入；黑方反之（y 越大）
+    let advanced = match Camp::from_piece(moving) {
+        Camp::Red => mv.to_y < 5,
+        Camp::Black => mv.to_y > 4,
+        Camp::None => false,
+    };
+    if advanced {
+        score += 20;
+    }
+    score
+}
+
 // 棋盘转换FEN逻辑
 pub fn board_fen(camp: &Camp, board: [[char; 9]; 10]) -> String {
     let mut fen = String::new();
@@ -746,6 +789,32 @@ pub fn fen_to_board(mut fen: &str) -> [[char; 9]; 10] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_piece_value() {
+        assert_eq!(piece_value('R'), 900);
+        assert_eq!(piece_value('c'), 450);
+        assert_eq!(piece_value('p'), 100);
+        assert_eq!(piece_value('K'), 10_000);
+        assert_eq!(piece_value(' '), 0);
+    }
+
+    #[test]
+    fn test_move_attack_score_capture() {
+        // 红车 a0 吃掉黑卒 a4：吃子价值 100，未过河不加分
+        let mut board = [[' '; 9]; 10];
+        board[9][0] = 'R';
+        board[5][0] = 'p';
+        assert_eq!(move_attack_score(board, "a0a4"), 100);
+    }
+
+    #[test]
+    fn test_move_attack_score_advance() {
+        // 红车 a0 前进到 a5（越过河界，board y=4），不吃子，仅前压 +20
+        let mut board = [[' '; 9]; 10];
+        board[9][0] = 'R';
+        assert_eq!(move_attack_score(board, "a0a5"), 20);
+    }
 
     #[test]
     fn test_red_board_to_fen() {

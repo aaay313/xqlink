@@ -10,6 +10,8 @@ use serde::Serialize;
 use tracing::debug;
 
 use crate::engine::EngineConfig;
+use crate::engine::Strength;
+use crate::engine::Style;
 use crate::SHARED_STATE;
 
 #[derive(Serialize, Deserialize)]
@@ -87,7 +89,7 @@ impl Config {
 }
 
 #[tauri::command]
-pub async fn get_engine_config() -> EngineConfig { SHARED_STATE.get().unwrap().config.read().unwrap().engine }
+pub async fn get_engine_config() -> EngineConfig { SHARED_STATE.get().unwrap().config.read().unwrap().engine.clone() }
 
 #[tauri::command]
 pub async fn set_engine_depth(depth: usize) {
@@ -125,6 +127,34 @@ pub async fn set_engine_hash(size: usize) {
     config.engine.hash = size;
     config.save();
     debug!("set_engine_hash: {}", size);
+}
+
+#[tauri::command]
+pub async fn set_engine_strength(strength: Strength) {
+    let state = SHARED_STATE.get().unwrap();
+    let mut config = state.config.write().unwrap();
+    config.engine.strength = strength;
+    config.save();
+    debug!("set_engine_strength: {:?}", strength);
+}
+
+#[tauri::command]
+pub async fn set_engine_style(style: Style) {
+    let state = SHARED_STATE.get().unwrap();
+    let mut config = state.config.write().unwrap();
+    config.engine.style = style;
+    config.save();
+    debug!("set_engine_style: {:?}", style);
+}
+
+#[tauri::command]
+pub async fn set_flying_knife(enabled: bool, knife: String) {
+    let state = SHARED_STATE.get().unwrap();
+    let mut config = state.config.write().unwrap();
+    config.engine.flying_knife = enabled;
+    config.engine.knife = knife.clone();
+    config.save();
+    debug!("set_flying_knife: {} -> {}", enabled, knife);
 }
 
 #[tauri::command]

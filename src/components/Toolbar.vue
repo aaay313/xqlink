@@ -52,9 +52,27 @@ interface EngineConfig {
     // show_wdl: number;
     chessdb_enabled: boolean;
     chessdb_timeout: number;
+    strength: string;
+    style: string;
+    flying_knife: boolean;
+    knife: string;
 }
 
 const mode = ref(options[0].value);
+
+/** 人机棋手强度三档（对应引擎 Skill Level） */
+const strengthOptions = [
+    { label: "弱", value: "weak" },
+    { label: "中", value: "medium" },
+    { label: "强", value: "strong" },
+];
+
+/** 行棋风格三档（进攻 / 防守 / 均衡） */
+const styleOptions = [
+    { label: "均衡", value: "balanced" },
+    { label: "进攻", value: "attack" },
+    { label: "防守", value: "defense" },
+];
 
 const config = ref<EngineConfig>({
     depth: 0,
@@ -63,6 +81,10 @@ const config = ref<EngineConfig>({
     hash: 0,
     chessdb_enabled: false,
     chessdb_timeout: 0,
+    strength: "strong",
+    style: "balanced",
+    flying_knife: false,
+    knife: "random",
 });
 
 const showEngineConfig = ref(false);
@@ -460,6 +482,22 @@ async function setEngineHash() {
     await invoke("set_engine_hash", { size: config.value.hash });
 }
 
+async function setEngineStrength() {
+    await invoke("set_engine_strength", { strength: config.value.strength });
+}
+
+async function setEngineStyle() {
+    await invoke("set_engine_style", { style: config.value.style });
+}
+
+async function setFlyingKnife() {
+    // 系统随机挑飞刀，无需用户指定
+    await invoke("set_flying_knife", {
+        enabled: config.value.flying_knife,
+        knife: "random",
+    });
+}
+
 async function setChessdb() {
     await invoke("set_chessdb", {
         enabled: config.value.chessdb_enabled,
@@ -599,6 +637,27 @@ async function toggleEngine() {
                             style="width: 120px"
                             @update:value="setEngineHash"
                         />
+                    </n-form-item>
+                    <n-form-item label="强度">
+                        <n-select
+                            v-model:value="config.strength"
+                            :options="strengthOptions"
+                            size="small"
+                            style="width: 120px"
+                            @update:value="setEngineStrength"
+                        />
+                    </n-form-item>
+                    <n-form-item label="风格">
+                        <n-select
+                            v-model:value="config.style"
+                            :options="styleOptions"
+                            size="small"
+                            style="width: 120px"
+                            @update:value="setEngineStyle"
+                        />
+                    </n-form-item>
+                    <n-form-item label="飞刀开局">
+                        <n-switch v-model:value="config.flying_knife" @update:value="setFlyingKnife" />
                     </n-form-item>
                     <n-form-item label="启用云库">
                         <n-switch v-model:value="config.chessdb_enabled" @update:value="setChessdb" />

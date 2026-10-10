@@ -15,7 +15,10 @@ use xcap::image::Rgba;
 
 use crate::chess;
 use crate::common;
+use crate::engine::EngineConfig;
 use crate::engine::QueryResult;
+use crate::engine::QueryState;
+use crate::knife;
 use crate::listen::ListenWindow;
 use crate::listen::Window;
 use crate::yolo::predict;
@@ -197,9 +200,16 @@ impl AnalysisContext {
     fn analyze_board(&mut self, camp: &chess::Camp, board: [[char; 9]; 10]) -> Option<BoardAnalysisResult> {
         let fen = chess::board_fen(camp, board);
         let config = SHARED_STATE.get().unwrap().config.read().unwrap();
-        let state = SHARED_STATE.get().unwrap();
-        let mut engine = state.engine.lock().unwrap();
-        let result = block_on(engine.search(&fen, &config.engine));
+
+        // 飞刀开局优先：命中则直接用飞刀着法，否则交给引擎
+        let result = match self.match_knife(camp, board, &config.engine) {
+            Some(knife_result) => Some(knife_result),
+            None => {
+                let state = SHARED_STATE.get().unwrap();
+                let mut engine = state.engine.lock().unwrap();
+                block_on(engine.search(&fen, &config.engine))
+            }
+        };
         result.as_ref()?;
 
         // 记下这次评估的分数（我方视角），棋谱会把它标在每一手上
@@ -210,6 +220,49 @@ impl AnalysisContext {
         let (expect_move, expect_board) =
             analyse(&self.app, result.unwrap(), board, self.our_turn)?;
         Some(BoardAnalysisResult { expect_move, expect_board })
+    }
+
+    /// 飞刀开局匹配：命中时返回飞刀着法的分析结果，否则返回 None 交给引擎。
+    ///
+    /// - 先手飞刀（我方执红）：初始局面第一步走预设飞刀。
+    /// - 后手飞刀（我方执黑）：对方（红方）第一步命中某飞刀的 trigger 时，走对应应手。
+    fn match_knife(
+        &self,
+        camp: &chess::Camp,
+        board: [[char; 9]; 10],
+        config: &EngineConfig,
+    ) -> Option<QueryResult> {
+        if !config.flying_knife {
+            return None;
+        }
+
+        let knife = match camp {
+            chess::Camp::Red => {
+                // 先手飞刀只在初始局面（红方第一步）触发
+                if !chess::startpos(board) {
+                    return None;
+                }
+                knife::pick_knife(&config.knife, knife::Side::Red, None)?
+            }
+            chess::Camp::Black => {
+                // 后手飞刀：匹配红方第一步
+                let trigger = self.opponent_first_move_iccs()?;
+                knife::pick_knife(&config.knife, knife::Side::Black, Some(&trigger))?
+            }
+            chess::Camp::None => return None,
+        };
+
+        let mut result = QueryResult::default();
+        result.pvs = vec![knife.move_.to_string()];
+        result.source = format!("飞刀·{}·{}", knife.name, knife.chinese);
+        result.state = QueryState::Success;
+        Some(result)
+    }
+
+    /// 取「对方（红方）第一步」的 ICCS。我方执黑时，棋谱里第一条非我方记录即对方第一步。
+    fn opponent_first_move_iccs(&self) -> Option<String> {
+        let history = SHARED_STATE.get()?.history.lock().ok()?;
+        history.iter().find(|m| !m.ours).map(|m| m.iccs.clone())
     }
 
     // 更新UI显示
@@ -326,6 +379,8 @@ struct Capture {
 pub struct MoveRecord {
     /// 中文着法，如「炮二平五」
     pub chinese: String,
+    /// 着法的 ICCS 坐标，如「h2e2」；供飞刀开局匹配「对方第一步」用
+    pub iccs: String,
     /// 是否由我方走出
     pub ours: bool,
     /// 走出这步**之前**引擎对局面的评分（我方视角，正数对我方有利）。
@@ -360,7 +415,7 @@ fn record_move(
     if let Some(state) = SHARED_STATE.get()
         && let Ok(mut history) = state.history.lock()
     {
-        history.push(MoveRecord { chinese, ours, score, fen: after_fen });
+        history.push(MoveRecord { chinese, iccs, ours, score, fen: after_fen });
     }
 }
 
@@ -517,12 +572,12 @@ pub fn analyse(
     let expect_board = chess::board_move(board, best_pv);
     let expect_move = chess::Changed::from_pv(best_pv, board);
 
-    let mut tmp_board = expect_board;
+    // pvs 现在是「候选着法列表」：每个候选都是对同一局面的并列选择，
+    // 中文着法必须都基于**原始盘面**推算，而不是逐个连续执行。
     result.moves.push(best_move);
     for pv in result.pvs.iter().skip(1).take(3) {
-        let mv = chess::board_move_chinese(tmp_board, pv);
+        let mv = chess::board_move_chinese(board, pv);
         result.moves.push(mv);
-        tmp_board = chess::board_move(tmp_board, pv);
     }
     // 把结果发送给前端（带上行棋方信息，前端据此决定是否显示建议）
     result.our_turn = our_turn;
