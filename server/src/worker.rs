@@ -224,39 +224,47 @@ impl AnalysisContext {
 
     /// 飞刀开局匹配：命中时返回飞刀着法的分析结果，否则返回 None 交给引擎。
     ///
-    /// - 先手飞刀（我方执红）：初始局面第一步走预设飞刀。
+    /// - 先手飞刀（我方执红）：红方已走序列匹配某飞刀套路的前缀，走套路下一步。
     /// - 后手飞刀（我方执黑）：对方（红方）第一步命中某飞刀的 trigger 时，走对应应手。
     fn match_knife(
         &self,
         camp: &chess::Camp,
-        board: [[char; 9]; 10],
+        _board: [[char; 9]; 10],
         config: &EngineConfig,
     ) -> Option<QueryResult> {
         if !config.flying_knife {
             return None;
         }
 
-        let knife = match camp {
+        let (name, next_move) = match camp {
             chess::Camp::Red => {
-                // 先手飞刀只在初始局面（红方第一步）触发
-                if !chess::startpos(board) {
-                    return None;
-                }
-                knife::pick_knife(&config.knife, knife::Side::Red, None)?
+                // 先手飞刀：按红方已走序列匹配套路前缀
+                let played = self.our_move_iccs();
+                let (k, mv) = knife::match_red_knife(&config.knife, &played)?;
+                (k.name, mv)
             }
             chess::Camp::Black => {
                 // 后手飞刀：匹配红方第一步
                 let trigger = self.opponent_first_move_iccs()?;
-                knife::pick_knife(&config.knife, knife::Side::Black, Some(&trigger))?
+                let (k, mv) = knife::match_black_knife(&config.knife, &trigger)?;
+                (k.name, mv)
             }
             chess::Camp::None => return None,
         };
 
         let mut result = QueryResult::default();
-        result.pvs = vec![knife.move_.to_string()];
-        result.source = format!("飞刀·{}·{}", knife.name, knife.chinese);
+        result.pvs = vec![next_move.to_string()];
+        result.source = format!("飞刀·{name}");
         result.state = QueryState::Success;
         Some(result)
+    }
+
+    /// 我方（红方）本局已走的着法序列（ICCS），用于先手飞刀套路的逐步匹配。
+    fn our_move_iccs(&self) -> Vec<String> {
+        let Some(history) = SHARED_STATE.get().and_then(|s| s.history.lock().ok()) else {
+            return Vec::new();
+        };
+        history.iter().filter(|m| m.ours).map(|m| m.iccs.clone()).collect()
     }
 
     /// 取「对方（红方）第一步」的 ICCS。我方执黑时，棋谱里第一条非我方记录即对方第一步。

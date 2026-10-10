@@ -4,7 +4,7 @@
 //! 亏损的着法，诱使对手按惯性应手、踏入陷阱。
 //!
 //! 飞刀分两类：
-//! - **先手飞刀**（红方先手第一步）：铁滑车、敢死炮、叠炮、九尾龟、御驾亲征、沉宫马。
+//! - **先手飞刀**（红方先手套路）：铁滑车、敢死炮、叠炮（多步），九尾龟、御驾亲征、沉宫马（单步）。
 //! - **后手飞刀**（黑方应对红方第一步）：瞎眼狗（红方进三/七兵，黑方弃同路卒抢先）。
 //!
 //! 所有着法均为 ICCS 坐标，已用引擎验证合法。
@@ -19,45 +19,50 @@ pub enum Side {
 /// 一个飞刀布局。
 #[derive(Debug, Clone, Copy)]
 pub struct Knife {
-    /// 飞刀名称（用于界面下拉与日志展示）
+    /// 飞刀名称（用于界面与日志展示）
     pub name: &'static str,
-    /// 中文着法（如「车一进一」）
-    pub chinese: &'static str,
     /// 先手飞刀还是后手飞刀
     pub side: Side,
     /// 后手飞刀需要匹配的「对方第一步」ICCS；先手飞刀为 None
     pub trigger: Option<&'static str>,
-    /// 我方飞刀着法（ICCS 坐标）
-    pub move_: &'static str,
+    /// 我方飞刀着法序列（ICCS 坐标）。先手飞刀是红方连续套路，后手飞刀是单步应手。
+    pub moves: &'static [&'static str],
 }
 
 /// 内置飞刀库。
 pub const KNIVES: &[Knife] = &[
-    // ---------- 先手飞刀（红方第一步） ----------
-    Knife { name: "铁滑车", chinese: "车一进一", side: Side::Red, trigger: None, move_: "i0i1" },
-    Knife { name: "敢死炮", chinese: "炮二进二", side: Side::Red, trigger: None, move_: "h2h4" },
-    Knife { name: "叠炮", chinese: "炮二进一", side: Side::Red, trigger: None, move_: "h2h3" },
-    Knife { name: "九尾龟", chinese: "兵一进一", side: Side::Red, trigger: None, move_: "i3i4" },
-    Knife { name: "御驾亲征", chinese: "帅五进一", side: Side::Red, trigger: None, move_: "e0e1" },
-    Knife { name: "沉宫马", chinese: "相三进一", side: Side::Red, trigger: None, move_: "g0i2" },
+    // ---------- 先手飞刀（红方连续套路） ----------
+    Knife { name: "铁滑车", side: Side::Red, trigger: None, moves: &["i0i1", "a0a1"] },
+    Knife { name: "敢死炮", side: Side::Red, trigger: None, moves: &["h2h4", "h4b4"] },
+    Knife { name: "叠炮", side: Side::Red, trigger: None, moves: &["h2h3", "b2h2"] },
+    Knife { name: "九尾龟", side: Side::Red, trigger: None, moves: &["i3i4"] },
+    Knife { name: "御驾亲征", side: Side::Red, trigger: None, moves: &["e0e1"] },
+    Knife { name: "沉宫马", side: Side::Red, trigger: None, moves: &["g0i2"] },
     // ---------- 后手飞刀（黑方应对红方第一步） ----------
-    Knife { name: "瞎眼狗", chinese: "卒7进1", side: Side::Black, trigger: Some("g3g4"), move_: "g6g5" },
-    Knife { name: "瞎眼狗", chinese: "卒3进1", side: Side::Black, trigger: Some("c3c4"), move_: "c6c5" },
+    Knife { name: "瞎眼狗", side: Side::Black, trigger: Some("g3g4"), moves: &["g6g5"] },
+    Knife { name: "瞎眼狗", side: Side::Black, trigger: Some("c3c4"), moves: &["c6c5"] },
 ];
 
-/// 按「所属方 + 触发着法」筛选飞刀。
+/// 按「红方已走序列」匹配先手飞刀，返回 (命中的飞刀, 下一步着法)。
 ///
-/// - `side`：先手（红方）还是后手（黑方）。
-/// - `trigger`：后手飞刀需要匹配的对方第一步；先手飞刀传 `None`。
-/// - `name`：`"random"` 时在匹配项中随机挑一个，否则按名称精确匹配。
-pub fn pick_knife(name: &str, side: Side, trigger: Option<&str>) -> Option<&'static Knife> {
-    let matched: Vec<&Knife> = KNIVES
+/// `played` 是红方本局已走的着法序列（ICCS）。当它正好是某个飞刀套路的
+/// 前缀、且还没走完时命中，返回该飞刀和「下一步」着法。
+///
+/// `name` 为 `"random"` 时在所有命中项里随机挑，否则按名称精确匹配。
+pub fn match_red_knife(name: &str, played: &[String]) -> Option<(&'static Knife, &'static str)> {
+    let matched: Vec<(&'static Knife, &'static str)> = KNIVES
         .iter()
-        .filter(|k| k.side == side)
-        .filter(|k| match (k.trigger, trigger) {
-            (Some(t), Some(a)) => t == a,
-            (None, None) => true,
-            _ => false,
+        .filter(|k| k.side == Side::Red)
+        .filter_map(|k| {
+            if played.len() >= k.moves.len() {
+                return None;
+            }
+            let is_prefix = played.iter().zip(k.moves.iter()).all(|(p, m)| p.as_str() == *m);
+            if is_prefix {
+                Some((k, k.moves[played.len()]))
+            } else {
+                None
+            }
         })
         .collect();
 
@@ -65,15 +70,40 @@ pub fn pick_knife(name: &str, side: Side, trigger: Option<&str>) -> Option<&'sta
         return None;
     }
 
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-
     if name == "random" {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
         Some(matched[(nanos as usize) % matched.len()])
     } else {
-        matched.into_iter().find(|k| k.name == name)
+        matched.into_iter().find(|(k, _)| k.name == name)
+    }
+}
+
+/// 按「对方第一步」匹配后手飞刀，返回 (命中的飞刀, 应手着法)。
+///
+/// `trigger` 是对方（红方）第一步的 ICCS。`name` 为 `"random"` 时随机挑。
+pub fn match_black_knife(name: &str, trigger: &str) -> Option<(&'static Knife, &'static str)> {
+    let matched: Vec<(&'static Knife, &'static str)> = KNIVES
+        .iter()
+        .filter(|k| k.side == Side::Black)
+        .filter(|k| k.trigger == Some(trigger))
+        .map(|k| (k, k.moves[0]))
+        .collect();
+
+    if matched.is_empty() {
+        return None;
+    }
+
+    if name == "random" {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        Some(matched[(nanos as usize) % matched.len()])
+    } else {
+        matched.into_iter().find(|(k, _)| k.name == name)
     }
 }
 
@@ -82,24 +112,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_pick_red_knife() {
-        assert_eq!(pick_knife("铁滑车", Side::Red, None).unwrap().move_, "i0i1");
-        assert_eq!(pick_knife("敢死炮", Side::Red, None).unwrap().move_, "h2h4");
-        assert!(pick_knife("不存在的飞刀", Side::Red, None).is_none());
+    fn test_match_red_knife_first_step() {
+        // 开局第一步，铁滑车命中走 i0i1
+        let (k, mv) = match_red_knife("铁滑车", &[]).unwrap();
+        assert_eq!(k.name, "铁滑车");
+        assert_eq!(mv, "i0i1");
     }
 
     #[test]
-    fn test_pick_black_knife_by_trigger() {
-        // 红方兵三进一 → 黑方卒7进1
-        assert_eq!(pick_knife("瞎眼狗", Side::Black, Some("g3g4")).unwrap().move_, "g6g5");
-        // 红方兵七进一 → 黑方卒3进1
-        assert_eq!(pick_knife("瞎眼狗", Side::Black, Some("c3c4")).unwrap().move_, "c6c5");
-        // 对方没进兵，瞎眼狗不触发
-        assert!(pick_knife("瞎眼狗", Side::Black, Some("h2e2")).is_none());
+    fn test_match_red_knife_second_step() {
+        // 红方已走 i0i1（铁滑车第一步），下一步走 a0a1
+        let (_, mv) = match_red_knife("铁滑车", &["i0i1".to_string()]).unwrap();
+        assert_eq!(mv, "a0a1");
     }
 
     #[test]
-    fn test_pick_random() {
-        assert!(pick_knife("random", Side::Red, None).is_some());
+    fn test_match_red_knife_prefix_mismatch() {
+        // 红方第一步走了别的（不是铁滑车套路），不命中
+        assert!(match_red_knife("铁滑车", &["h2e2".to_string()]).is_none());
+    }
+
+    #[test]
+    fn test_match_black_knife() {
+        assert_eq!(match_black_knife("瞎眼狗", "g3g4").unwrap().1, "g6g5");
+        assert_eq!(match_black_knife("瞎眼狗", "c3c4").unwrap().1, "c6c5");
+        assert!(match_black_knife("瞎眼狗", "h2e2").is_none());
+    }
+
+    #[test]
+    fn test_random() {
+        assert!(match_red_knife("random", &[]).is_some());
     }
 }
