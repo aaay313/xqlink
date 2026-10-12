@@ -27,6 +27,10 @@ struct SharedState {
     latest_fen: Mutex<String>,
     /// 本局棋谱（中文着法），由监听线程在每步走子时追加
     history: Mutex<Vec<worker::MoveRecord>>,
+    /// 用户手动指定的轮次（界面「轮到我方/对方行棋」按钮）。
+    /// None=跟随自动判断；Some(true)=轮到我方；Some(false)=等对方。
+    /// 监听线程每轮读取并清空，手动值优先于自动判断，生效一次。
+    turn_override: Mutex<Option<bool>>,
 }
 
 static SHARED_STATE: OnceLock<SharedState> = OnceLock::new();
@@ -53,6 +57,7 @@ pub fn run() {
                     listen_thread: Mutex::new(None),
                     latest_fen: Mutex::new(String::new()),
                     history: Mutex::new(Vec::new()),
+                    turn_override: Mutex::new(None),
                 }
             });
 
@@ -64,6 +69,7 @@ pub fn run() {
             current_fen,
             game_history,
             save_history,
+            set_turn,
             listen::list_windows,
             worker::start_listen,
             worker::stop_listen,
@@ -87,6 +93,20 @@ fn reload_engine(app: tauri::AppHandle) {
     let state = SHARED_STATE.get().unwrap();
     let engine_config = state.config.read().unwrap().engine.clone();
     state.engine.lock().unwrap().reload(&lib_path, &engine_config);
+}
+
+/// 手动指定当前轮次：界面「轮到我方 / 对方行棋」按钮调用。
+///
+/// 自动判断（盘面推断 + 头像读秒）偶尔会判错，用户看一眼就知道真实轮次，
+/// 点按钮直接纠正。手动值存入共享状态，监听线程下一轮读取并清空 ——
+/// 优先于自动判断，且只生效一次（之后走子仍由自动逻辑接管）。
+#[tauri::command]
+fn set_turn(our_turn: bool) {
+    if let Some(state) = SHARED_STATE.get() {
+        if let Ok(mut t) = state.turn_override.lock() {
+            *t = Some(our_turn);
+        }
+    }
 }
 
 /// 返回最近一次识别出的盘面 FEN，供界面"复制局面"使用。

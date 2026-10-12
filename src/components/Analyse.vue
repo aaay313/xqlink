@@ -1,6 +1,7 @@
 <script setup lang="ts">
+import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { LogInst, NCard, NDivider, NFlex, NLog, NProgress, NTag, NText } from 'naive-ui';
+import { LogInst, NButton, NCard, NDivider, NFlex, NLog, NProgress, NSpace, NTag, NText } from 'naive-ui';
 import { computed, ref } from 'vue';
 
 import { clearHint, setHint } from '../hint';
@@ -83,6 +84,14 @@ function resetBest() {
     clearHint();
 }
 
+/** 点击按钮手动切换轮次：自动判断（盘面推断 + 头像读秒）偶尔判错时，
+ *  用户点一下直接纠正。切到「轮到我方」后端会立刻用最近盘面分析出建议。 */
+async function toggleTurn() {
+    const next = !ourTurn.value;
+    ourTurn.value = next; // 乐观更新，点击立即有视觉反馈
+    await invoke("set_turn", { ourTurn: next });
+}
+
 // 后端观测到行棋方变化时通知：false 表示我方刚走完、轮到对方
 listen('turn', async (event) => {
     ourTurn.value = event.payload as boolean;
@@ -142,17 +151,32 @@ listen('analyse', async (event) => {
         <template #header>
             <n-flex align="center" justify="space-between">
                 <span>局面分析</span>
-                <n-tag size="tiny" :bordered="false" :type="listening ? 'info' : 'default'">
-                    {{ listening ? (mirror ? "黑方视角" : "红方视角") : "未监听" }}
-                </n-tag>
+                <n-space :size="6" align="center">
+                    <n-tag size="tiny" :bordered="false" :type="listening ? 'info' : 'default'">
+                        {{ listening ? (mirror ? "黑方视角" : "红方视角") : "未监听" }}
+                    </n-tag>
+                    <n-button
+                        v-if="listening"
+                        size="tiny"
+                        :type="ourTurn ? 'primary' : 'warning'"
+                        @click="toggleTurn"
+                    >
+                        {{ ourTurn ? "轮到我方" : "对方行棋" }}
+                    </n-button>
+                </n-space>
             </n-flex>
         </template>
         <n-text v-if="!listening" type="info" class="analyse-wait">
             点上方「启」开始分析
         </n-text>
-        <n-text v-else-if="waiting" type="info" class="analyse-wait" strong>
-            等待对方落子…
-        </n-text>
+        <n-flex v-else-if="waiting" vertical align="center">
+            <n-text type="info" class="analyse-wait" strong>
+                等待对方落子…
+            </n-text>
+            <n-text depth="3" class="analyse-hint">
+                判断不对？点右上角按钮切换轮次
+            </n-text>
+        </n-flex>
         <template v-else>
             <n-flex justify="space-between" align="end">
                 <n-text type="info" class="analyse-title" strong>
@@ -194,6 +218,12 @@ listen('analyse', async (event) => {
 .analyse-wait {
     font-size: medium;
     opacity: 0.75;
+}
+
+/* 等待状态下提示可以用右上角按钮纠正轮次 */
+.analyse-hint {
+    font-size: 11px;
+    margin-top: 4px;
 }
 
 /* 次要信息行：胜率 / 深度 / 耗时 */

@@ -260,6 +260,12 @@ impl AnalysisContext {
         Some(result)
     }
 
+    /// 读取并清空用户手动指定的轮次（界面「轮到我方/对方行棋」按钮）。
+    /// 返回 Some 时优先于自动判断，且只生效一次。
+    fn take_turn_override(&self) -> Option<bool> {
+        SHARED_STATE.get()?.turn_override.lock().ok()?.take()
+    }
+
     /// 用头像读秒判断轮到谁行棋（判定原理见 clock 模块）。
     ///
     /// 正在行棋一方的头像上有倒计时读秒圈（暗红圆环+白色数字），等待方没有。
@@ -633,6 +639,32 @@ fn process_analysis_loop(mut context: AnalysisContext) {
         thread::sleep(Duration::from_millis(interval).saturating_sub(last_elapsed));
 
         let started = std::time::Instant::now();
+
+        // 用户手动切换轮次（界面「轮到我方 / 对方行棋」按钮）优先于自动判断。
+        // 切到「轮到我方」时立刻用最近一次识别到的盘面分析并给出建议，
+        // 用户点完马上能看到着法，不必等下一手。
+        if let Some(manual) = context.take_turn_override() {
+            let next_state = if manual {
+                info!("手动切换轮次 → 轮到我方，用最近盘面分析");
+                context.set_turn(true);
+                if let Some(camp) = context.last_camp {
+                    if camp != chess::Camp::None && context.last_board != [[' '; 9]; 10] {
+                        if let Some(result) = context.analyze_board(&camp, context.last_board) {
+                            context.expect_move = result.expect_move;
+                            context.expect_board = result.expect_board;
+                        }
+                    }
+                }
+                ChessboardState::OpponentTurn
+            } else {
+                info!("手动切换轮次 → 等待对方落子");
+                context.set_turn(false);
+                ChessboardState::OurTurn
+            };
+            current_state = next_state;
+            last_elapsed = started.elapsed();
+            continue;
+        }
 
         // 捕获并分析棋盘
         let capture = match context.capture_and_analyze_board() {
