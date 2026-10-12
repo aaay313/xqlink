@@ -74,6 +74,19 @@ impl ListenWindow {
         Some(pic)
     }
 
+    /// 抓取**整个窗口**（不裁剪）。供头像读秒检测使用 —— 头像在棋盘抓取区之外。
+    pub fn capture_full(&self) -> Option<image::ImageBuffer<image::Rgba<u8>, Vec<u8>>> {
+        self.window.capture_image().ok()
+    }
+
+    /// 棋盘抓取区（含半格缓冲）在窗口内的边界；尚未设置时返回 None。
+    pub fn board_bound(&self) -> Option<(u32, u32, u32, u32)> {
+        if self.w == 0 || self.h == 0 {
+            return None;
+        }
+        Some((self.x, self.y, self.w, self.h))
+    }
+
     pub fn set_sub_bound(&mut self, x: u32, y: u32, w: u32, h: u32) {
         self.x = x;
         self.y = y;

@@ -8,6 +8,7 @@ use engine::Engine;
 use tauri::Manager as _;
 
 mod chess;
+mod clock;
 mod common;
 mod config;
 mod engine;

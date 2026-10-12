@@ -14,6 +14,7 @@ use xcap::image::ImageBuffer;
 use xcap::image::Rgba;
 
 use crate::chess;
+use crate::clock;
 use crate::common;
 use crate::engine::EngineConfig;
 use crate::engine::QueryResult;
@@ -257,6 +258,20 @@ impl AnalysisContext {
         result.source = format!("飞刀·{name}");
         result.state = QueryState::Success;
         Some(result)
+    }
+
+    /// 用头像读秒判断轮到谁行棋（判定原理见 clock 模块）。
+    ///
+    /// 正在行棋一方的头像上有倒计时读秒圈（暗红圆环+白色数字），等待方没有。
+    /// 返回 Some(true)=轮到我方、Some(false)=轮到对方、None=无法判断。
+    fn detect_turn_by_clock(&self) -> Option<bool> {
+        let bound = self.window.board_bound()?;
+        let img = self.window.capture_full()?;
+        let verdict = clock::detect_turn(&img, bound);
+        if let Some(t) = verdict {
+            info!("读秒判定轮次 → {}", if t { "我方" } else { "对方" });
+        }
+        verdict
     }
 
     /// 我方（红方）本局已走的着法序列（ICCS），用于先手飞刀套路的逐步匹配。
@@ -780,20 +795,25 @@ fn process_analysis_loop(mut context: AnalysisContext) {
                                 let after_fen = chess::board_fen(&camp, board);
                                 context.handle_move(&changed, prev_board, after_fen, camp.eq(&changed.camp));
 
-                                if camp.eq(&changed.camp) {
-                                    // 我方移动：轮到对方，清空建议
-                                    debug!("我方移动, {} -> {}, 跳过分析", changed.from, changed.to);
-                                    context.set_turn(false);
-                                    ChessboardState::OurTurn
-                                } else {
-                                    // 对方移动，需要分析
+                                // 走子后轮次：头像读秒优先（正在行棋一方头像上有读秒圈，
+                                // 比盘面推断可靠，盘面推断会被识别误差带偏）；
+                                // 读秒不可用时退回按走子方推断。
+                                let our_turn = context
+                                    .detect_turn_by_clock()
+                                    .unwrap_or_else(|| !camp.eq(&changed.camp));
+                                context.set_turn(our_turn);
+                                if our_turn {
+                                    // 对方刚走完，轮到我方，需要分析
                                     debug!("对方移动, {} -> {}, 需要分析", changed.from, changed.to);
-                                    context.set_turn(true);
                                     if let Some(result) = context.analyze_board(&camp, board) {
                                         context.expect_move = result.expect_move;
                                         context.expect_board = result.expect_board;
                                     }
                                     ChessboardState::OpponentTurn
+                                } else {
+                                    // 我方刚走完：轮到对方，清空建议
+                                    debug!("我方移动, {} -> {}, 跳过分析", changed.from, changed.to);
+                                    ChessboardState::OurTurn
                                 }
                             }
                             chess::BoardChangeState::One => {
@@ -917,20 +937,25 @@ fn process_analysis_loop(mut context: AnalysisContext) {
                                 let after_fen = chess::board_fen(&camp, board);
                                 context.handle_move(&changed, prev_board, after_fen, camp.eq(&changed.camp));
 
-                                if camp.eq(&changed.camp) {
-                                    // 我方移动：轮到对方，清空建议
-                                    debug!("我方移动, {} -> {}, 跳过分析", changed.from, changed.to);
-                                    context.set_turn(false);
-                                    ChessboardState::OurTurn
-                                } else {
-                                    // 对方移动，需要分析
+                                // 走子后轮次：头像读秒优先（正在行棋一方头像上有读秒圈，
+                                // 比盘面推断可靠，盘面推断会被识别误差带偏）；
+                                // 读秒不可用时退回按走子方推断。
+                                let our_turn = context
+                                    .detect_turn_by_clock()
+                                    .unwrap_or_else(|| !camp.eq(&changed.camp));
+                                context.set_turn(our_turn);
+                                if our_turn {
+                                    // 对方刚走完，轮到我方，需要分析
                                     debug!("对方移动, {} -> {}, 需要分析", changed.from, changed.to);
-                                    context.set_turn(true);
                                     if let Some(result) = context.analyze_board(&camp, board) {
                                         context.expect_move = result.expect_move;
                                         context.expect_board = result.expect_board;
                                     }
                                     ChessboardState::OpponentTurn
+                                } else {
+                                    // 我方刚走完：轮到对方，清空建议
+                                    debug!("我方移动, {} -> {}, 跳过分析", changed.from, changed.to);
+                                    ChessboardState::OurTurn
                                 }
                             }
                             chess::BoardChangeState::One => {
