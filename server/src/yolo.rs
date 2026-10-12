@@ -14,7 +14,9 @@ static SESSION: OnceLock<ort::session::Session> = OnceLock::new();
 
 pub const IMAGE_WIDTH: usize = 640;
 pub const IMAGE_HEIGHT: usize = 640;
-const CONFIDENCE_THRESHOLD: f32 = 0.7;
+// 置信度阈值：原 0.7 偏高，低对比度/动画中的棋子常被过滤导致「棋子消失」。
+// 降到 0.55 保留更多候选，配合 NMS 数量上限 + 多帧投票 + 规则纠错过滤误检。
+const CONFIDENCE_THRESHOLD: f32 = 0.55;
 const IOU_THRESHOLD: f32 = 0.5;
 const LABELS: [char; 15] = ['n', 'b', 'a', 'k', 'r', 'c', 'p', 'R', 'N', 'A', 'K', 'B', 'C', 'P', '0'];
 const LIMIT: [usize; 15] = [2, 2, 2, 1, 2, 2, 5, 2, 2, 2, 1, 2, 2, 5, 1];

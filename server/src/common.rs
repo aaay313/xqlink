@@ -65,6 +65,13 @@ pub fn detections_to_board(detections: &[yolo::Detection]) -> Result<(chess::Cam
                     continue;
                 }
 
+                // 同一格子被多个检测框命中时，只保留第一个。
+                // detections 已经过 NMS 且按置信度降序排列，第一个就是置信度最高的，
+                // 避免低置信度误检覆盖正确结果（这是「棋子识别错误」的一个来源）。
+                if board[row][col] != ' ' {
+                    continue;
+                }
+
                 // 构建board
                 board[row][col] = det.label;
 
