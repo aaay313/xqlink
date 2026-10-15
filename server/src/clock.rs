@@ -56,7 +56,7 @@ pub fn detect_turn(
     img: &ImageBuffer<Rgba<u8>, Vec<u8>>,
     board: (u32, u32, u32, u32),
 ) -> Option<bool> {
-    let (bx, by, bw, bh) = board;
+    let (_bx, by, bw, bh) = board;
     if bw == 0 || bh == 0 {
         return None;
     }

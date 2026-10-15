@@ -85,6 +85,12 @@ impl Style {
 
 #[derive(Debug, serde::Serialize, Clone, serde::Deserialize)]
 pub struct EngineConfig {
+    /// 搜索深度**上限**（0 = 不限，纯按时间搜索）。
+    ///
+    /// ⚠️ 这个值是硬上限：引擎搜到该深度立即停止，不会用满 `time` 预算。
+    /// 实测（i7-8750H / 6 线程 / 256MB Hash / 中局）：`depth 14 + 1000ms`
+    /// 只用 111ms 就停（浪费 89% 预算，仅 14 层）；放开上限后同样 1 秒
+    /// 可搜到 19 层。故默认给足上限（30），让它由时间预算来终止搜索。
     pub depth: usize,
     pub time: usize,
     pub threads: usize,
@@ -109,7 +115,7 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            depth: 20,
+            depth: 30,
             time: 5000,
             threads: 4,
             hash: 64,
@@ -206,7 +212,13 @@ impl Engine {
     /// 引擎每加深一层都会为每个 multipv 编号输出一行 info，这里只保留
     /// 「达到的最大深度」那一组，返回按 multipv 升序排列的 info 行。
     fn bestmove(&mut self, depth: usize, time: usize, multi_pv: usize) -> Vec<String> {
-        self.write_command(format!("go depth {} movetime {}", depth, time));
+        // depth 是搜索深度上限（0 = 不限）。设得过低会在时间预算耗尽前提前停止，
+        // 白白浪费算力（实测 depth 14 只用掉 1 秒预算的 11%）。
+        if depth == 0 {
+            self.write_command(format!("go movetime {}", time));
+        } else {
+            self.write_command(format!("go depth {} movetime {}", depth, time));
+        }
         let mut latest: HashMap<usize, String> = HashMap::new();
         let mut max_depth = 0usize;
         loop {
