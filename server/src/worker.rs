@@ -576,13 +576,26 @@ impl BoardVoter {
 pub fn get_board(image: ImageBuffer<Rgba<u8>, Vec<u8>>) -> Option<(chess::Camp, [[char; 9]; 10])> {
     // 推理失败（模型与运行时不匹配、内存不足等）不该让整个程序崩掉 ——
     // 丢掉这一帧、下一轮重试即可。原实现用的是 unwrap。
-    let data = match predict(image) {
+    let mut data = match predict(image.clone()) {
         Ok(data) => data,
         Err(err) => {
             warn!("识别推理失败，跳过本帧: {err}");
             return None;
         }
     };
+
+    // 原图未检出棋盘时，用反相图补一个棋盘框（深色皮肤适配，见 invert_image）。
+    // 棋子仍取原图检测结果：反相后棋子样式（蓝底白字）同样偏离训练分布，
+    // 实测同一局面原图重建 22 子、反相仅 12 子 —— 故反相只借棋盘框，不借棋子。
+    if !data.iter().any(|d| d.label == '0') {
+        if let Ok(inverted) = predict(common::invert_image(&image)) {
+            if let Some(board_det) = inverted.into_iter().find(|d| d.label == '0') {
+                trace!("原图未检出棋盘，借反相图的棋盘框（深色皮肤）");
+                data.push(board_det);
+            }
+        }
+    }
+
     if let Ok((camp, mut board)) = common::detections_to_board(&data) {
         chess::board_fix(&camp, &mut board);
         Some((camp, board))
@@ -1038,7 +1051,19 @@ pub async fn start_listen(app: AppHandle, target: Window) -> Result<(), String> 
     let image_h = image.height();
     let image_w = image.width();
 
-    let detections = predict(image).map_err(|e| format!("识别失败: {e}"))?;
+    let mut detections = predict(image.clone()).map_err(|e| format!("识别失败: {e}"))?;
+
+    // 原图未检出棋盘时尝试反相：深色皮肤棋盘（暗底亮线）不在模型训练分布内，
+    // 反相后变回"亮底暗线"即可检出（实测置信度 0→0.95）。
+    // 没有这一步时，深色皮肤会让「启」直接失败在"未识别到棋盘"。
+    if !detections.iter().any(|d| d.label == '0') {
+        if let Ok(inverted) = predict(common::invert_image(&image)) {
+            if inverted.iter().any(|d| d.label == '0') {
+                info!("原图未检出棋盘，反相后检出（深色棋盘皮肤）");
+                detections = inverted;
+            }
+        }
+    }
 
     match common::detections_bound(image_w, image_h, &detections) {
         Ok((x, y, w, h)) => {

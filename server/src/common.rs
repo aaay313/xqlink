@@ -1,7 +1,24 @@
 use tracing::trace;
+use xcap::image::ImageBuffer;
+use xcap::image::Rgba;
 
 use crate::chess;
 use crate::yolo;
+
+/// 反相图像（RGB 取补，保持 alpha）。
+///
+/// 用途：适配深色皮肤棋盘。当前 YOLO 模型只在"亮底暗线"的经典棋盘上训练过，
+/// 遇到"暗底亮线"的深色皮肤（如 JJ 象棋的紫黑棋盘）时棋盘检出率归零
+/// （实测置信度 0→0.95 的差距）。反相后棋盘变回"亮底暗线"，即可被检出。
+pub fn invert_image(img: &ImageBuffer<Rgba<u8>, Vec<u8>>) -> ImageBuffer<Rgba<u8>, Vec<u8>> {
+    let mut out = img.clone();
+    for px in out.pixels_mut() {
+        px[0] = 255 - px[0];
+        px[1] = 255 - px[1];
+        px[2] = 255 - px[2];
+    }
+    out
+}
 
 // detections_bound 获取截图的边界
 pub fn detections_bound(
