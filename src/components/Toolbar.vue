@@ -596,7 +596,7 @@ async function toggleEngine() {
         <n-drawer v-model:show="showEngineConfig" :width="300" placement="right">
             <n-drawer-content title="引擎配置">
                 <n-form :model="config" label-placement="left" label-width="80">
-                    <n-form-item label="深度">
+                    <n-form-item label="深度" feedback="搜索深度上限，达到即停（建议 14~18）">
                         <n-input-number
                             v-model:value="config.depth"
                             button-placement="both"
@@ -606,7 +606,7 @@ async function toggleEngine() {
                             @update:value="setEngineDepth"
                         />
                     </n-form-item>
-                    <n-form-item label="时间">
+                    <n-form-item label="时间" feedback="每步思考时长上限（秒），越小反应越快">
                         <n-input-number
                             v-model:value="config.time"
                             button-placement="both"

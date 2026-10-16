@@ -115,11 +115,12 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            // 默认值取"响应速度与棋力"的平衡点（实测：中局约 1.2s 出着法、16 层）：
-            // depth 是上限（够用即停），time 是时间预算（复杂局面最多等这么久）。
-            // 原默认 time=5000 会让每步等 5 秒，用户体感"反应慢"。
-            depth: 20,
-            time: 1500,
+            // 默认值取"响应速度优先"的平衡点（实测 i7-8750H / 6 线程 / 256MB Hash /
+            // 中局 + MultiPV=1）：depth 16 上限约 250ms 出着法，time 1000 仅作保险
+            // （复杂局面最多等 1 秒）。depth 是"够用即停"的上限而非目标 ——
+            // 放开到 30 会让引擎死等满 1 秒，用户体感"反应慢"。
+            depth: 16,
+            time: 1000,
             threads: 4,
             hash: 256,
             show_wdl: false,

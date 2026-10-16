@@ -1,6 +1,5 @@
 use std::fs;
 use std::fs::File;
-use std::io::BufReader;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -49,8 +48,16 @@ impl Config {
         debug!("load config from '{}'", config_path.display());
 
         if config_path.exists() {
-            let reader = BufReader::new(File::open(&config_path).unwrap());
-            if let Ok(mut config) = serde_json::from_reader::<_, Config>(reader) {
+            // 读取为字符串并去掉可能存在的 UTF-8 BOM。
+            //
+            // 背景：用 Windows PowerShell 的 `Set-Content -Encoding UTF8`、
+            // 或记事本"另存为 UTF-8"保存过配置时，文件会带上 BOM；而 serde_json
+            // 不认 BOM，会解析失败 —— 触发下面的"重建默认值"分支，
+            // 用户的全部设置（含 time/depth 等影响响应速度的参数）在下次启动时
+            // 会被悄悄重置为默认值。这里统一剥离 BOM，避免该问题。
+            let text = fs::read_to_string(&config_path).unwrap_or_default();
+            let text = text.trim_start_matches('\u{feff}');
+            if let Ok(mut config) = serde_json::from_str::<Config>(text) {
                 match config.config_path {
                     Some(ref path) => {
                         if path != &config_path {
@@ -66,9 +73,11 @@ impl Config {
                 return config;
             };
 
-            // 解析失败代表配置不兼容, 直接删除后重新使用默认配置，后续考虑增量更新方式
-            std::fs::remove_file(&config_path).unwrap();
-            debug!("remove old config '{}'", config_path.display())
+            // 解析失败代表配置不兼容。**先备份再重建** —— 原实现直接删除，
+            // 用户遇到时所有设置无声丢失，既无法排查也无法恢复。
+            let backup = config_path.with_extension("json.bak");
+            let _ = fs::rename(&config_path, &backup);
+            debug!("配置解析失败，已备份到 '{}' 并重建默认配置", backup.display())
         }
 
         let config = Config { config_path: Some(config_path), ..Default::default() };
