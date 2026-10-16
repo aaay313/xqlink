@@ -115,10 +115,13 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            depth: 30,
-            time: 5000,
+            // 默认值取"响应速度与棋力"的平衡点（实测：中局约 1.2s 出着法、16 层）：
+            // depth 是上限（够用即停），time 是时间预算（复杂局面最多等这么久）。
+            // 原默认 time=5000 会让每步等 5 秒，用户体感"反应慢"。
+            depth: 20,
+            time: 1500,
             threads: 4,
-            hash: 64,
+            hash: 256,
             show_wdl: false,
             chessdb_enabled: true,
             chessdb_timeout: 5,
