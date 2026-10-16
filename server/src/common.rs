@@ -61,10 +61,18 @@ pub fn detections_bound(
 const MODEL_CELL_W: f32 = yolo::IMAGE_WIDTH as f32 / 9.0;
 const MODEL_CELL_H: f32 = yolo::IMAGE_HEIGHT as f32 / 10.0;
 
-// detections_to_board 识别结果转换为棋盘结构
-pub fn detections_to_board(detections: &[yolo::Detection]) -> Result<(chess::Camp, [[char; 9]; 10]), String> {
+// detections_to_board 识别结果转换为棋盘结构。
+//
+// 除棋盘外还返回每格的**类别置信度**（cls_prob）：模型在若干类别上存在
+// "对峙样本"（如兵 P 的第二候选是马 N，cls_p 0.69/0.17；象 b 的第二候选
+// 是马 n，0.88/0.30），这类检测的 conf 仍可能超过入盘阈值、取最大值即取错。
+// 调用方用该置信度做"易混类别低置信度兜底"（见 worker::stabilize_confusable）。
+pub fn detections_to_board(
+    detections: &[yolo::Detection],
+) -> Result<(chess::Camp, [[char; 9]; 10], [[f32; 9]; 10]), String> {
     let mut camp = chess::Camp::None;
     let mut board = [[' '; 9]; 10];
+    let mut conf_board = [[0f32; 9]; 10];
 
     match detections.iter().find(|&&x| x.label == '0') {
         Some(_) => {
@@ -91,6 +99,7 @@ pub fn detections_to_board(detections: &[yolo::Detection]) -> Result<(chess::Cam
 
                 // 构建board
                 board[row][col] = det.label;
+                conf_board[row][col] = det.cls_prob;
 
                 // 判断阵营
                 if camp == chess::Camp::None && (3..=5).contains(&col) && row >= 7 {
@@ -104,5 +113,5 @@ pub fn detections_to_board(detections: &[yolo::Detection]) -> Result<(chess::Cam
         }
         None => return Err("not board".to_string()),
     }
-    Ok((camp, board))
+    Ok((camp, board, conf_board))
 }

@@ -164,9 +164,10 @@ impl AnalysisContext {
         debug!("识别耗时 {:?}（其中抓图 {:?}）", started.elapsed(), captured);
 
         let prev_board = self.last_board;
-        result.map(|(camp, board)| {
-            // 先多帧投票过滤偶发误判，再用规则纠错兜底明显错误，
-            // 最后才交给状态机做差分比较
+        result.map(|(camp, board, conf)| {
+            // 易混类别低置信度兜底（纠正"把兵认成马"这类同格换类误判），
+            // 再做多帧投票过滤偶发误判，最后用规则纠错兜底明显错误
+            let board = stabilize_confusable(board, conf, prev_board);
             let voted = self.voter.push(board);
             let board = correct_with_rules(voted, prev_board);
             Capture { camp, board, hash }
@@ -189,8 +190,9 @@ impl AnalysisContext {
             return true;
         }
 
-        if let Some((_, conf_board)) = get_board(conf_image) {
-            // 与首帧用同一套纠错，否则两边标准不一致会永远确认不上
+        if let Some((_, conf_board, conf)) = get_board(conf_image) {
+            // 与首帧用同一套处理（兜底 + 纠错），否则两边标准不一致会永远确认不上
+            let conf_board = stabilize_confusable(conf_board, conf, self.last_board);
             let conf_board = correct_with_rules(conf_board, self.last_board);
             return conf_board == board;
         }
@@ -466,6 +468,52 @@ const PIECE_LIMIT: [(char, usize); 14] = [
     ('p', 5),
 ];
 
+/// 易混类别低置信度时的「上一帧兜底」。
+///
+/// 实测模型在若干类别上存在"对峙样本"（如兵 P 的第二候选是马 N，
+/// cls_p 0.69/0.17；象 b 的第二候选是马 n，0.88/0.30）—— 这类检测的
+/// conf 仍可能超过入盘阈值，取最大值就可能取错，表现为"把兵识别成马"。
+///
+/// 纠错规则（只覆盖「同格同方换类」这一种误分类形态）：
+///   上一帧该格有棋子、与本帧识别为同一方（同为红方或同为黑方）、但类别不同，
+///   且本帧的类别置信度偏低 → 判为误分类，保留上一帧的值。
+///
+/// 走子（空格→棋子）与吃子（跨方换子）的形状是"有无变化"或"跨方变化"，
+/// 不会命中此规则，因此不影响正常行棋。
+fn stabilize_confusable(
+    board: [[char; 9]; 10], conf: [[f32; 9]; 10], prev_board: [[char; 9]; 10],
+) -> [[char; 9]; 10] {
+    // 类别置信度低于此值视为"分类犹豫"。实测正常识别 cls_p > 0.9，
+    // 对峙样本落在 0.65~0.90 区间。
+    const CLS_CONF_THRESHOLD: f32 = 0.85;
+
+    let mut result = board;
+    let mut corrected = 0u32;
+
+    for y in 0..10 {
+        for x in 0..9 {
+            let (cur, old) = (board[y][x], prev_board[y][x]);
+            if cur == ' ' || old == ' ' || cur == old {
+                continue;
+            }
+            if conf[y][x] >= CLS_CONF_THRESHOLD {
+                continue; // 分类够自信，不动
+            }
+            // 同方判定：大写 = 红方，小写 = 黑方
+            if cur.is_ascii_uppercase() == old.is_ascii_uppercase() {
+                result[y][x] = old;
+                corrected += 1;
+            }
+        }
+    }
+
+    if corrected > 0 {
+        debug!("易混类别兜底：还原了 {corrected} 个低置信度换类格子");
+    }
+
+    result
+}
+
 /// 用「棋子数量上限」这条硬规则纠正识别错误。
 ///
 /// 识别偶尔会把某一格认成别的棋子 —— 最典型的就是界面上"凭空多出一个炮"。
@@ -573,7 +621,12 @@ impl BoardVoter {
     }
 }
 
-pub fn get_board(image: ImageBuffer<Rgba<u8>, Vec<u8>>) -> Option<(chess::Camp, [[char; 9]; 10])> {
+/// 识别一帧图像，返回 (阵营, 棋盘, 每格类别置信度)。
+///
+/// 类别置信度供调用方做「易混类别低置信度兜底」（见 stabilize_confusable）。
+pub fn get_board(
+    image: ImageBuffer<Rgba<u8>, Vec<u8>>,
+) -> Option<(chess::Camp, [[char; 9]; 10], [[f32; 9]; 10])> {
     // 推理失败（模型与运行时不匹配、内存不足等）不该让整个程序崩掉 ——
     // 丢掉这一帧、下一轮重试即可。原实现用的是 unwrap。
     let mut data = match predict(image.clone()) {
@@ -596,9 +649,9 @@ pub fn get_board(image: ImageBuffer<Rgba<u8>, Vec<u8>>) -> Option<(chess::Camp, 
         }
     }
 
-    if let Ok((camp, mut board)) = common::detections_to_board(&data) {
+    if let Ok((camp, mut board, conf)) = common::detections_to_board(&data) {
         chess::board_fix(&camp, &mut board);
-        Some((camp, board))
+        Some((camp, board, conf))
     } else {
         None
     }
@@ -1115,12 +1168,71 @@ mod tests {
     use super::correct_with_rules;
     use super::image_hash;
     use super::infer_mover;
+    use super::stabilize_confusable;
     use crate::chess;
     use xcap::image::ImageBuffer;
     use xcap::image::Rgba;
 
     fn empty() -> [[char; 9]; 10] {
         [[' '; 9]; 10]
+    }
+
+    fn conf_map(v: f32) -> [[f32; 9]; 10] {
+        [[v; 9]; 10]
+    }
+
+    #[test]
+    fn stabilize_keeps_prev_when_same_side_low_confidence() {
+        // 实际是红兵，本帧低置信度认成红马 → 应保留红兵（用户反馈的"兵→马"）
+        let mut prev = empty();
+        prev[5][4] = 'P';
+        let mut board = prev;
+        board[5][4] = 'N';
+        let out = stabilize_confusable(board, conf_map(0.69), prev);
+        assert_eq!(out[5][4], 'P', "同格同方换类且低置信度，应还原为上一帧");
+    }
+
+    #[test]
+    fn stabilize_trusts_model_when_confidence_high() {
+        // 高置信度的换类（cls_p >= 0.85）不拦截 —— 宁可信任模型也不要误改
+        let mut prev = empty();
+        prev[5][4] = 'P';
+        let mut board = prev;
+        board[5][4] = 'N';
+        let out = stabilize_confusable(board, conf_map(0.95), prev);
+        assert_eq!(out[5][4], 'N', "高置信度换类应保留本帧识别");
+    }
+
+    #[test]
+    fn stabilize_ignores_normal_moves() {
+        // 走子：上一帧空格 → 本帧有子。即便低置信度也不能拦（否则永远走不动）
+        let mut prev = empty();
+        prev[5][4] = ' ';
+        let mut board = prev;
+        board[4][4] = 'P'; // 红兵前进一格
+        let out = stabilize_confusable(board, conf_map(0.6), prev);
+        assert_eq!(out[4][4], 'P', "空格→棋子 不应被兜底拦截");
+    }
+
+    #[test]
+    fn stabilize_ignores_captures() {
+        // 吃子：上一帧是黑卒 → 本帧红马落位（跨方换子）。低置信度也不能拦
+        let mut prev = empty();
+        prev[5][4] = 'p';
+        let mut board = prev;
+        board[5][4] = 'N';
+        let out = stabilize_confusable(board, conf_map(0.6), prev);
+        assert_eq!(out[5][4], 'N', "跨方换子 不应被兜底拦截");
+    }
+
+    #[test]
+    fn stabilize_ignores_unchanged_cells() {
+        // 类别相同：无需处理
+        let mut prev = empty();
+        prev[5][4] = 'P';
+        let board = prev;
+        let out = stabilize_confusable(board, conf_map(0.5), prev);
+        assert_eq!(out[5][4], 'P');
     }
 
     #[test]

@@ -88,7 +88,7 @@ pub fn predict(origin_img: ImageBuffer<Rgba<u8>, Vec<u8>>) -> ort::Result<Vec<De
             if conf < CONFIDENCE_THRESHOLD {
                 None
             } else {
-                Some(Detection::new(row[0], row[1], row[2], row[3], class_id, conf))
+                Some(Detection::new(row[0], row[1], row[2], row[3], class_id, conf, max_prob))
             }
         })
         .collect();
@@ -104,13 +104,16 @@ pub struct Detection {
     pub y1: f32,
     pub confidence: f32,
     pub label: char,
+    /// 纯类别置信度（不含目标置信度 obj）。
+    /// `confidence` = obj × cls_prob，两者混合；判断"分类是否犹豫"需要单独看它。
+    pub cls_prob: f32,
 
     idx: usize,
     area: f32,
 }
 
 impl Detection {
-    fn new(x: f32, y: f32, w: f32, h: f32, idx: usize, confidence: f32) -> Self {
+    fn new(x: f32, y: f32, w: f32, h: f32, idx: usize, confidence: f32, cls_prob: f32) -> Self {
         Self {
             x0: x - w / 2.0,
             x1: x + w / 2.0,
@@ -120,6 +123,7 @@ impl Detection {
             idx,
             label: LABELS[idx],
             confidence,
+            cls_prob,
         }
     }
 
