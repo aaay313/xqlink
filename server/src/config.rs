@@ -8,10 +8,44 @@ use serde::Deserialize;
 use serde::Serialize;
 use tracing::debug;
 
+use crate::auto::PlayMode;
 use crate::engine::EngineConfig;
 use crate::engine::Strength;
 use crate::engine::Style;
 use crate::SHARED_STATE;
+
+/// 自动操作配置（自动走棋 / 自动认输）。
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AutoConfig {
+    /// 是否自动替我方走棋。
+    pub auto_play: bool,
+    /// 走子方式：点起点→点终点（JJ 象棋），或按住拖拽。
+    pub play_mode: PlayMode,
+    /// **最多**自动认输多少把（0 = 不自动认输）。
+    ///
+    /// 语义是"认输额度"：设成 3 表示程序自动下棋时，前 3 把会在
+    /// **对方走出第一步之后**（即那一把的开局）点一次认输；
+    /// 认输满 3 把后自动认输功能停用，之后的棋局正常自动下，不再认输。
+    /// 已认输的把数记在 `resign_count`（持久化，跨监听重启累计）。
+    pub auto_resign_limit: u32,
+    /// 已自动认输的把数（持久化）。
+    pub resign_count: u32,
+    /// 「认输」按钮在客户区**图像像素**中的坐标（由界面标定写入）。
+    /// None = 尚未标定。
+    pub resign_point: Option<(i32, i32)>,
+}
+
+impl Default for AutoConfig {
+    fn default() -> Self {
+        Self {
+            auto_play: false,
+            play_mode: PlayMode::default(),
+            auto_resign_limit: 0,
+            resign_count: 0,
+            resign_point: None,
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct Config {
@@ -23,6 +57,9 @@ pub struct Config {
     pub confirm_interval: u64,
 
     pub engine: EngineConfig,
+    /// 自动操作设置。`#[serde(default)]` 保证旧配置文件缺该字段时平滑升级。
+    #[serde(default)]
+    pub auto: AutoConfig,
 }
 
 impl Default for Config {
@@ -33,6 +70,7 @@ impl Default for Config {
             timer_interval: 100,
             confirm_interval: 200,
             engine: Default::default(),
+            auto: Default::default(),
         }
     }
 }
@@ -175,4 +213,97 @@ pub async fn set_chessdb(enabled: bool, timeout: Option<u64>) {
     config.engine.chessdb_timeout = timeout;
     config.save();
     debug!("set_chessdb: {} -> {}", enabled, timeout);
+}
+
+// ---------------------------------------------------------------------------
+// 自动操作（自动走棋 / 自动认输）
+// ---------------------------------------------------------------------------
+
+/// 读取当前自动操作配置，供界面回显。
+#[tauri::command]
+pub async fn get_auto_config() -> AutoConfig {
+    SHARED_STATE.get().unwrap().config.read().unwrap().auto.clone()
+}
+
+/// 开关自动走棋。
+#[tauri::command]
+pub async fn set_auto_play(enabled: bool) {
+    let state = SHARED_STATE.get().unwrap();
+    let mut config = state.config.write().unwrap();
+    config.auto.auto_play = enabled;
+    config.save();
+    debug!("set_auto_play: {}", enabled);
+}
+
+/// 设置走子方式（点击起终点 / 拖拽）。
+#[tauri::command]
+pub async fn set_auto_play_mode(mode: PlayMode) {
+    let state = SHARED_STATE.get().unwrap();
+    let mut config = state.config.write().unwrap();
+    config.auto.play_mode = mode;
+    config.save();
+    debug!("set_auto_play_mode: {:?}", mode);
+}
+
+/// 设置「最多自动认输多少把」（0 = 不自动认输）。
+///
+/// 改这个设置会同时把已认输把数清零 —— 否则改完数字也不会再触发。
+#[tauri::command]
+pub async fn set_auto_resign_limit(count: u32) {
+    let state = SHARED_STATE.get().unwrap();
+    let mut config = state.config.write().unwrap();
+    config.auto.auto_resign_limit = count;
+    config.auto.resign_count = 0;
+    config.save();
+    debug!("set_auto_resign_limit: {}", count);
+}
+
+/// 重置已认输把数（下次重新计额度）。
+#[tauri::command]
+pub async fn reset_resign_count() {
+    let state = SHARED_STATE.get().unwrap();
+    let mut config = state.config.write().unwrap();
+    config.auto.resign_count = 0;
+    config.save();
+    debug!("reset_resign_count");
+}
+
+/// 标定「认输」按钮：读取当前鼠标位置，换算成目标窗口客户区图像坐标后保存。
+///
+/// 存的是**客户区坐标**而非屏幕坐标 —— 这样窗口移动、分辨率变化后
+/// 依然能准确定位按钮。调用前请先把鼠标移到 JJ 象棋的「认输」按钮上。
+#[tauri::command]
+pub async fn calibrate_resign_point() -> Result<(i32, i32), String> {
+    let (sx, sy) = crate::auto::cursor_position().ok_or("无法读取鼠标位置")?;
+    let state = SHARED_STATE.get().ok_or("程序尚未初始化")?;
+    let frame = state
+        .auto_frame
+        .lock()
+        .map_err(|_| "读取窗口信息失败")?
+        .clone()
+        .ok_or("尚未开始监听，请先点「启」后再标定")?;
+    let (ox, oy, scale) = frame;
+    let cx = ((sx - ox) as f32 * scale).round() as i32;
+    let cy = ((sy - oy) as f32 * scale).round() as i32;
+    let mut config = state.config.write().unwrap();
+    config.auto.resign_point = Some((cx, cy));
+    config.save();
+    debug!("calibrate_resign_point: screen({},{}) -> client({},{})", sx, sy, cx, cy);
+    Ok((cx, cy))
+}
+
+/// 清除已标定的「认输」按钮位置。
+#[tauri::command]
+pub async fn clear_resign_point() {
+    let state = SHARED_STATE.get().unwrap();
+    let mut config = state.config.write().unwrap();
+    config.auto.resign_point = None;
+    config.save();
+    debug!("clear_resign_point");
+}
+
+/// 读取当前鼠标的屏幕绝对坐标（标定流程用）。
+#[tauri::command]
+pub async fn capture_cursor_pos() -> Option<(i32, i32)> {
+    crate::auto::cursor_position()
 }

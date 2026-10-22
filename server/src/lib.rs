@@ -7,6 +7,7 @@ use std::thread;
 use engine::Engine;
 use tauri::Manager as _;
 
+mod auto;
 mod chess;
 mod clock;
 mod common;
@@ -31,6 +32,10 @@ struct SharedState {
     /// None=跟随自动判断；Some(true)=轮到我方；Some(false)=等对方。
     /// 监听线程每轮读取并清空，手动值优先于自动判断，生效一次。
     turn_override: Mutex<Option<bool>>,
+    /// 目标窗口的几何信息：(客户区屏幕原点 x, y, DPI 缩放比)。
+    /// 由监听线程持续刷新 —— 标定「认输」按钮位置时要把屏幕坐标换算成
+    /// 客户区图像坐标，窗口移动/缩放后仍需准确，故不能只记一次。
+    auto_frame: Mutex<Option<(i32, i32, f32)>>,
 }
 
 static SHARED_STATE: OnceLock<SharedState> = OnceLock::new();
@@ -58,6 +63,7 @@ pub fn run() {
                     latest_fen: Mutex::new(String::new()),
                     history: Mutex::new(Vec::new()),
                     turn_override: Mutex::new(None),
+                    auto_frame: Mutex::new(None),
                 }
             });
 
@@ -82,6 +88,14 @@ pub fn run() {
             config::set_engine_style,
             config::set_flying_knife,
             config::set_chessdb,
+            config::get_auto_config,
+            config::set_auto_play,
+            config::set_auto_play_mode,
+            config::set_auto_resign_limit,
+            config::reset_resign_count,
+            config::calibrate_resign_point,
+            config::clear_resign_point,
+            config::capture_cursor_pos,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

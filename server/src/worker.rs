@@ -13,6 +13,7 @@ use tracing::warn;
 use xcap::image::ImageBuffer;
 use xcap::image::Rgba;
 
+use crate::auto;
 use crate::chess;
 use crate::clock;
 use crate::common;
@@ -87,6 +88,10 @@ struct AnalysisContext {
     last_camp: Option<chess::Camp>,
     /// 棋格级多帧投票器，用于过滤单帧偶发误判
     voter: BoardVoter,
+    /// 已自动走过的盘面。自动走棋后盘面会变，用它避免同一局面被重复点击。
+    auto_moved_board: Option<[[char; 9]; 10]>,
+    /// 本把是否已经执行过自动认输。防止同一把里反复点认输。
+    resigned_this_game: bool,
 }
 
 unsafe impl Send for AnalysisContext {}
@@ -109,6 +114,8 @@ impl AnalysisContext {
             last_ui_fen: String::new(),
             last_camp: None,
             voter: BoardVoter::new(),
+            auto_moved_board: None,
+            resigned_this_game: false,
         }
     }
 
@@ -159,6 +166,10 @@ impl AnalysisContext {
 
         let hash = image_hash(&image);
         let result = get_board(image);
+
+        // 刷新窗口几何：自动点击换算屏幕坐标、标定认输按钮都要用，
+        // 窗口被移动/缩放后必须跟着更新。
+        self.refresh_auto_frame();
 
         // 抓图与识别各占多少是调优最关心的指标，放 debug 级避免 INFO 下刷屏
         debug!("识别耗时 {:?}（其中抓图 {:?}）", started.elapsed(), captured);
@@ -222,7 +233,108 @@ impl AnalysisContext {
 
         let (expect_move, expect_board) =
             analyse(&self.app, result.unwrap(), board, self.our_turn)?;
+
+        // 自动走棋：把引擎建议的着法直接点在棋盘上（若已开启）
+        self.try_auto_move(camp, board, &expect_move);
+
         Some(BoardAnalysisResult { expect_move, expect_board })
+    }
+
+    /// 构造当前窗口的屏幕坐标映射（自动点击用）。
+    fn screen_map(&self) -> Option<auto::ScreenMap> {
+        let (x, y, w, h) = self.window.board_bound()?;
+        Some(auto::ScreenMap {
+            origin: self.window.client_origin(),
+            scale: self.window.scale_factor(),
+            board_rect: (x, y, w, h),
+        })
+    }
+
+    /// 刷新共享状态里的窗口几何 —— 标定「认输」按钮位置时要把屏幕坐标
+    /// 换算成客户区坐标，窗口被移动/缩放后必须跟着更新。
+    fn refresh_auto_frame(&self) {
+        let origin = self.window.client_origin();
+        let scale = self.window.scale_factor();
+        if let Some(state) = SHARED_STATE.get()
+            && let Ok(mut frame) = state.auto_frame.lock()
+        {
+            *frame = Some((origin.0, origin.1, scale));
+        }
+    }
+
+    /// 自动走棋：把引擎建议的着法换算成屏幕坐标并点击。
+    fn try_auto_move(
+        &mut self,
+        camp: &chess::Camp,
+        board: [[char; 9]; 10],
+        expect: &chess::Changed,
+    ) {
+        let (enabled, mode) = {
+            let config = SHARED_STATE.get().unwrap().config.read().unwrap();
+            (config.auto.auto_play, config.auto.play_mode)
+        };
+        if !enabled {
+            return;
+        }
+        // 同一局面不重复点：分析会被多次调用（确认、投票），但只应走一次
+        if self.auto_moved_board == Some(board) {
+            return;
+        }
+        let Some(map) = self.screen_map() else { return; };
+        let Some((from_row, from_col)) = parse_iccs_pos(&expect.from) else { return; };
+        let Some((to_row, to_col)) = parse_iccs_pos(&expect.to) else { return; };
+
+        // 目标窗口必须在前台，否则点击会落到当前活动的其它窗口上
+        auto::focus_window(self.window.hwnd());
+        if auto::play_move(&map, camp, (from_row, from_col), (to_row, to_col), mode) {
+            info!("自动走棋: {} -> {}", expect.from, expect.to);
+            self.auto_moved_board = Some(board);
+        } else {
+            warn!("自动走棋失败: {} -> {}", expect.from, expect.to);
+        }
+    }
+
+    /// 本把是否需要自动认输：认输额度尚未用完。
+    ///
+    /// 额度语义："最多自动认输 N 把"。设成 3 时前 3 把各认输一次，
+    /// 用满后自动认输停用，后续棋局正常自动下。
+    fn should_resign_now(&self) -> bool {
+        let config = SHARED_STATE.get().unwrap().config.read().unwrap();
+        let limit = config.auto.auto_resign_limit;
+        limit > 0 && config.auto.resign_count < limit
+    }
+
+    /// 执行自动认输：点击已标定的「认输」按钮，并消耗一次认输额度。
+    fn do_resign(&mut self) {
+        let state = SHARED_STATE.get().unwrap();
+        let (limit, count, point) = {
+            let config = state.config.read().unwrap();
+            (
+                config.auto.auto_resign_limit,
+                config.auto.resign_count,
+                config.auto.resign_point,
+            )
+        };
+        let Some((rx, ry)) = point else {
+            warn!("需要自动认输，但尚未标定「认输」按钮位置（设置面板里点「标定认输按钮」）");
+            return;
+        };
+        let Some(map) = self.screen_map() else { return; };
+        let (ox, oy) = map.origin;
+        let scale = map.scale;
+
+        auto::focus_window(self.window.hwnd());
+        // 标定存的是客户区图像像素 → 屏幕绝对坐标
+        let sx = (ox as f32 + rx as f32 / scale).round() as i32;
+        let sy = (oy as f32 + ry as f32 / scale).round() as i32;
+        if auto::click_at(sx, sy) {
+            let mut config = state.config.write().unwrap();
+            config.auto.resign_count = count + 1;
+            config.save();
+            info!("已自动认输（{}/{} 把）", count + 1, limit);
+        } else {
+            warn!("自动认输点击失败");
+        }
     }
 
     /// 飞刀开局匹配：命中时返回飞刀着法的分析结果，否则返回 None 交给引擎。
@@ -621,6 +733,18 @@ impl BoardVoter {
     }
 }
 
+/// ICCS 位置（如 "h2"）转成「红方在下」视角的棋盘坐标 (row, col)。
+///
+/// row 是**红方在下**视角的行号（0 = 黑方底线），与 `chess::Move::new` 一致；
+/// 换算到屏幕坐标时的视角翻转由 `auto::ScreenMap::board_to_screen` 负责。
+fn parse_iccs_pos(pos: &str) -> Option<(usize, usize)> {
+    let mut cs = pos.chars();
+    let col = cs.next()? as usize - 97; // 'a'..'i' → 0..8
+    let digit = cs.next()? as usize; // '0'..'9' → 48..57
+    let row = 57usize.checked_sub(digit)?; // '0'→9（底部），'9'→0（顶部）
+    Some((row, col))
+}
+
 /// 识别一帧图像，返回 (阵营, 棋盘, 每格类别置信度)。
 ///
 /// 类别置信度供调用方做「易混类别低置信度兜底」（见 stabilize_confusable）。
@@ -881,6 +1005,16 @@ fn process_analysis_loop(mut context: AnalysisContext) {
 
                         match board_state {
                             chess::BoardChangeState::Move => {
+                                // 对方先手时，对方这一步就是「这一把的开局之后」——
+                                // 此时认输按钮可用，执行认输。
+                                // 我方先手已在 StartPos 分支认过，这里不重复。
+                                if !context.resigned_this_game
+                                    && chess::Camp::Black.eq(&camp)
+                                    && context.should_resign_now()
+                                {
+                                    context.do_resign();
+                                    context.resigned_this_game = true;
+                                }
                                 // 走子前的盘面 —— 记谱要用它推算中文着法
                                 let prev_board = context.last_board;
                                 context.last_board = board;
@@ -937,6 +1071,14 @@ fn process_analysis_loop(mut context: AnalysisContext) {
                         context.last_board = board;
                         context.update_ui(&camp, board);
 
+                        // 新的一局开始：重置"本把是否已认输"
+                        context.resigned_this_game = false;
+                        // 我方执红 = 我方先手，棋局刚开局就能认输，直接认输
+                        if context.should_resign_now() {
+                            context.do_resign();
+                            context.resigned_this_game = true;
+                        }
+
                         // 调用引擎查询
                         if let Some(result) = context.analyze_board(&camp, board) {
                             context.expect_move = result.expect_move;
@@ -950,6 +1092,11 @@ fn process_analysis_loop(mut context: AnalysisContext) {
                     // 开局且我方执黑 → 红先行，等对方先走
                     debug!("对方先手，跳过分析");
                     context.set_turn(false);
+                    // 新的一局开始：重置"本把是否已认输"
+                    // 认输要等对方走出第一步（此时认输按钮才可用），见 StartPos→Move 分支
+                    if context.last_board != board {
+                        context.resigned_this_game = false;
+                    }
                     context.last_board = board;
                     context.update_ui(&camp, board);
                     ChessboardState::StartPos

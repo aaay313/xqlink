@@ -513,6 +513,86 @@ async function getEngineConfig() {
     };
 }
 
+// ---------------------------------------------------------------------------
+// 自动操作（自动走棋 / 自动认输）
+// ---------------------------------------------------------------------------
+
+interface AutoConfig {
+    auto_play: boolean;
+    play_mode: "click" | "drag";
+    /** 最多自动认输多少把（0 = 不认输） */
+    auto_resign_limit: number;
+    /** 已自动认输的把数 */
+    resign_count: number;
+    /** 已标定的认输按钮位置（客户区坐标） */
+    resign_point: [number, number] | null;
+}
+
+const autoConfig = ref<AutoConfig>({
+    auto_play: false,
+    play_mode: "click",
+    auto_resign_limit: 0,
+    resign_count: 0,
+    resign_point: null,
+});
+
+const showAutoConfig = ref(false);
+
+const playModeOptions = [
+    { label: "点击起点和终点", value: "click" },
+    { label: "按住拖拽", value: "drag" },
+];
+
+async function getAutoConfig() {
+    autoConfig.value = await invoke("get_auto_config");
+}
+
+async function setAutoPlay() {
+    await invoke("set_auto_play", { enabled: autoConfig.value.auto_play });
+}
+
+async function setAutoPlayMode() {
+    await invoke("set_auto_play_mode", { mode: autoConfig.value.play_mode });
+}
+
+async function setAutoResignLimit() {
+    await invoke("set_auto_resign_limit", { count: autoConfig.value.auto_resign_limit });
+    await getAutoConfig();
+}
+
+async function resetResignCount() {
+    await invoke("reset_resign_count");
+    await getAutoConfig();
+}
+
+/** 标定「认输」按钮：让用户把鼠标移到 JJ 象棋的认输按钮上再确定。 */
+function calibrateResignPoint() {
+    dialog.warning({
+        title: "标定认输按钮",
+        content:
+            "请先把鼠标移动到 JJ 象棋的「认输」按钮上，然后点「确定」记录位置。窗口移动或缩放后仍然有效。",
+        positiveText: "确定（记录当前位置）",
+        negativeText: "取消",
+        onPositiveClick: async () => {
+            try {
+                await invoke("calibrate_resign_point");
+                await getAutoConfig();
+                dialog.success({
+                    title: "标定成功",
+                    content: "已记录认输按钮位置。",
+                    positiveText: "好",
+                });
+            } catch (e) {
+                dialog.error({
+                    title: "标定失败",
+                    content: String(e),
+                    positiveText: "好",
+                });
+            }
+        },
+    });
+}
+
 async function toggleEngine() {
     isEngineRunning.value ? await stopListen() : await startListen();
 }
@@ -565,6 +645,19 @@ async function toggleEngine() {
                             >
                         </template>
                         引擎配置
+                    </n-tooltip>
+
+                    <n-tooltip trigger="hover" placement="bottom">
+                        <template #trigger>
+                            <n-button
+                                circle
+                                size="small"
+                                type="primary"
+                                @click="showAutoConfig = true; getAutoConfig()"
+                                >自</n-button
+                            >
+                        </template>
+                        自动操作（自动走棋 / 自动认输）
                     </n-tooltip>
 
                     <n-divider vertical />
@@ -672,6 +765,61 @@ async function toggleEngine() {
                             style="width: 120px"
                             @update:value="setChessdb"
                         />
+                    </n-form-item>
+                </n-form>
+            </n-drawer-content>
+        </n-drawer>
+
+        <n-drawer v-model:show="showAutoConfig" :width="330" placement="right">
+            <n-drawer-content title="自动操作">
+                <n-form :model="autoConfig" label-placement="left" label-width="100">
+                    <n-form-item label="自动走棋" feedback="引擎算出着法后自动点在棋盘上">
+                        <n-switch
+                            v-model:value="autoConfig.auto_play"
+                            @update:value="setAutoPlay"
+                        />
+                    </n-form-item>
+                    <n-form-item label="走子方式" feedback="JJ 象棋用「点击起点和终点」">
+                        <n-select
+                            v-model:value="autoConfig.play_mode"
+                            :options="playModeOptions"
+                            @update:value="setAutoPlayMode"
+                        />
+                    </n-form-item>
+
+                    <n-divider style="margin: 10px 0" />
+
+                    <n-form-item
+                        label="认输额度"
+                        feedback="最多自动认输多少把（0=不认输）。我方先手开局即认输，对方先手等他走完第一步"
+                    >
+                        <n-input-number
+                            v-model:value="autoConfig.auto_resign_limit"
+                            :min="0"
+                            :max="999"
+                            style="width: 120px"
+                            @update:value="setAutoResignLimit"
+                        />
+                    </n-form-item>
+                    <n-form-item label="已认输">
+                        <n-space align="center" :size="8">
+                            <n-tag size="small" :bordered="false" type="info">
+                                {{ autoConfig.resign_count }} / {{ autoConfig.auto_resign_limit }}
+                            </n-tag>
+                            <n-button size="tiny" tertiary @click="resetResignCount">重置</n-button>
+                        </n-space>
+                    </n-form-item>
+                    <n-form-item label="认输按钮" feedback="标定 JJ 象棋「认输」按钮的位置">
+                        <n-space align="center" :size="8">
+                            <n-tag
+                                size="small"
+                                :bordered="false"
+                                :type="autoConfig.resign_point ? 'success' : 'default'"
+                            >
+                                {{ autoConfig.resign_point ? "已标定" : "未标定" }}
+                            </n-tag>
+                            <n-button size="tiny" @click="calibrateResignPoint">标定</n-button>
+                        </n-space>
                     </n-form-item>
                 </n-form>
             </n-drawer-content>

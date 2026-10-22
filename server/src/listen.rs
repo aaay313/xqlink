@@ -43,6 +43,12 @@ pub struct ListenWindow {
     y: u32,
     w: u32,
     h: u32,
+
+    /// 客户区图像（**未裁剪**）的尺寸。
+    ///
+    /// 捕获到的图像是物理像素 × DPI 缩放比，用它除以客户区物理尺寸
+    /// 就能精确还原缩放比 —— 自动点击换算屏幕坐标时需要这个比例。
+    client_size: std::cell::Cell<(u32, u32)>,
 }
 
 impl ListenWindow {
@@ -51,7 +57,14 @@ impl ListenWindow {
         let windows = xcap::Window::all().ok()?;
         for window in windows {
             if window.id().ok() == Some(target.id) {
-                return Some(Self { window, x: 0, y: 0, w: 0, h: 0 });
+                return Some(Self {
+                    window,
+                    x: 0,
+                    y: 0,
+                    w: 0,
+                    h: 0,
+                    client_size: std::cell::Cell::new((0, 0)),
+                });
             }
         }
         None
@@ -63,6 +76,8 @@ impl ListenWindow {
     /// 而不是让整个程序崩掉 —— 这是长时间挂机时最容易被触发的故障点。
     pub fn capture(&self) -> Option<image::ImageBuffer<image::Rgba<u8>, Vec<u8>>> {
         let mut pic = self.window.capture_image().ok()?;
+        // 先记下未裁剪的客户区尺寸（DPI 换算要用），再裁剪。
+        self.client_size.set((pic.width(), pic.height()));
         // 窗口大小可能被用户改动，裁剪前必须重新校验边界：
         // 原实现直接 sub_image，一旦缓存的区域超出新窗口尺寸就会 panic。
         if self.w > 0
@@ -85,6 +100,26 @@ impl ListenWindow {
             return None;
         }
         Some((self.x, self.y, self.w, self.h))
+    }
+
+    /// 客户区图像像素与物理像素之比，即 DPI 缩放比。
+    pub fn scale_factor(&self) -> f32 {
+        let (img_w, _) = self.client_size.get();
+        let phys = self.window.width().unwrap_or(0);
+        if img_w == 0 || phys == 0 {
+            return 1.0;
+        }
+        img_w as f32 / phys as f32
+    }
+
+    /// 客户区左上角的屏幕绝对坐标（物理像素）。
+    pub fn client_origin(&self) -> (i32, i32) {
+        (self.window.x().unwrap_or(0), self.window.y().unwrap_or(0))
+    }
+
+    /// 目标窗口句柄（自动点击前用它把窗口切到前台）。
+    pub fn hwnd(&self) -> u32 {
+        self.window.id().unwrap_or(0)
     }
 
     pub fn set_sub_bound(&mut self, x: u32, y: u32, w: u32, h: u32) {
