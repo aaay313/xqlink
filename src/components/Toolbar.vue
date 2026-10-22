@@ -526,8 +526,16 @@ interface AutoConfig {
     auto_resign_limit: number;
     /** 已自动认输的把数 */
     resign_count: number;
-    /** 已标定的认输按钮位置（客户区坐标） */
-    resign_point: [number, number] | null;
+    /** 认输第一步：底部工具栏「投降」入口（客户区坐标） */
+    resign_menu_point: [number, number] | null;
+    /** 认输第二步：弹出菜单里的「退出 / 投降」 */
+    resign_confirm_point: [number, number] | null;
+    /** 认输第三步：确认弹窗（"退出将判负"）里的「退出」 */
+    resign_dialog_point: [number, number] | null;
+    /** 结算界面的「开始下一局」按钮 */
+    next_game_point: [number, number] | null;
+    /** 认输后是否自动开始下一局 */
+    auto_next_game: boolean;
 }
 
 const autoConfig = ref<AutoConfig>({
@@ -536,7 +544,11 @@ const autoConfig = ref<AutoConfig>({
     input_mode: "auto",
     auto_resign_limit: 0,
     resign_count: 0,
-    resign_point: null,
+    resign_menu_point: null,
+    resign_confirm_point: null,
+    resign_dialog_point: null,
+    next_game_point: null,
+    auto_next_game: true,
 });
 
 const showAutoConfig = ref(false);
@@ -568,31 +580,33 @@ async function setAutoInputMode() {
     await invoke("set_auto_input_mode", { mode: autoConfig.value.input_mode });
 }
 
-async function setAutoResignLimit() {
-    await invoke("set_auto_resign_limit", { count: autoConfig.value.auto_resign_limit });
-    await getAutoConfig();
+async function setAutoNextGame() {
+    await invoke("set_auto_next_game", { enabled: autoConfig.value.auto_next_game });
 }
 
-async function resetResignCount() {
-    await invoke("reset_resign_count");
-    await getAutoConfig();
-}
+const calibrateTargets = {
+    resign_menu: "认输第一步：底部工具栏的「投降」入口",
+    resign_confirm: "认输第二步：点开菜单后出现的「退出 / 投降」",
+    resign_dialog: "认输第三步：确认弹窗（退出将判负）里的「退出」",
+    next_game: "对局结束、结算界面上的「开始下一局」按钮",
+} as const;
 
-/** 标定「认输」按钮：让用户把鼠标移到 JJ 象棋的认输按钮上再确定。 */
-function calibrateResignPoint() {
+/** 标定某个按钮位置：让用户把鼠标移过去再确定。 */
+function calibratePoint(
+    target: "resign_menu" | "resign_confirm" | "resign_dialog" | "next_game",
+) {
     dialog.warning({
-        title: "标定认输按钮",
-        content:
-            "请先把鼠标移动到 JJ 象棋的「认输」按钮上，然后点「确定」记录位置。窗口移动或缩放后仍然有效。",
+        title: "标定按钮位置",
+        content: `请先把鼠标移动到【${calibrateTargets[target]}】上，然后点「确定」记录位置。窗口移动或缩放后仍然有效。`,
         positiveText: "确定（记录当前位置）",
         negativeText: "取消",
         onPositiveClick: async () => {
             try {
-                await invoke("calibrate_resign_point");
+                await invoke("calibrate_point", { target });
                 await getAutoConfig();
                 dialog.success({
                     title: "标定成功",
-                    content: "已记录认输按钮位置。",
+                    content: `已记录：${calibrateTargets[target]}`,
                     positiveText: "好",
                 });
             } catch (e) {
@@ -604,6 +618,16 @@ function calibrateResignPoint() {
             }
         },
     });
+}
+
+async function setAutoResignLimit() {
+    await invoke("set_auto_resign_limit", { count: autoConfig.value.auto_resign_limit });
+    await getAutoConfig();
+}
+
+async function resetResignCount() {
+    await invoke("reset_resign_count");
+    await getAutoConfig();
 }
 
 async function toggleEngine() {
@@ -832,17 +856,65 @@ async function toggleEngine() {
                             <n-button size="tiny" tertiary @click="resetResignCount">重置</n-button>
                         </n-space>
                     </n-form-item>
-                    <n-form-item label="认输按钮" feedback="标定 JJ 象棋「认输」按钮的位置">
+                    <n-form-item label="认输①入口" feedback="底部工具栏的「投降」入口">
                         <n-space align="center" :size="8">
                             <n-tag
                                 size="small"
                                 :bordered="false"
-                                :type="autoConfig.resign_point ? 'success' : 'default'"
+                                :type="autoConfig.resign_menu_point ? 'success' : 'default'"
                             >
-                                {{ autoConfig.resign_point ? "已标定" : "未标定" }}
+                                {{ autoConfig.resign_menu_point ? "已标定" : "未标定" }}
                             </n-tag>
-                            <n-button size="tiny" @click="calibrateResignPoint">标定</n-button>
+                            <n-button size="tiny" @click="calibratePoint('resign_menu')"
+                                >标定</n-button
+                            >
                         </n-space>
+                    </n-form-item>
+                    <n-form-item label="认输②菜单项" feedback="点开菜单后的「退出 / 投降」">
+                        <n-space align="center" :size="8">
+                            <n-tag
+                                size="small"
+                                :bordered="false"
+                                :type="autoConfig.resign_confirm_point ? 'success' : 'default'"
+                            >
+                                {{ autoConfig.resign_confirm_point ? "已标定" : "未标定" }}
+                            </n-tag>
+                            <n-button size="tiny" @click="calibratePoint('resign_confirm')"
+                                >标定</n-button
+                            >
+                        </n-space>
+                    </n-form-item>
+                    <n-form-item label="认输③确认" feedback="确认弹窗（退出将判负）里的「退出」">
+                        <n-space align="center" :size="8">
+                            <n-tag
+                                size="small"
+                                :bordered="false"
+                                :type="autoConfig.resign_dialog_point ? 'success' : 'default'"
+                            >
+                                {{ autoConfig.resign_dialog_point ? "已标定" : "未标定" }}
+                            </n-tag>
+                            <n-button size="tiny" @click="calibratePoint('resign_dialog')"
+                                >标定</n-button
+                            >
+                        </n-space>
+                    </n-form-item>
+                    <n-form-item label="开始下一局" feedback="结算界面上的「开始下一局」按钮">
+                        <n-space align="center" :size="8">
+                            <n-tag
+                                size="small"
+                                :bordered="false"
+                                :type="autoConfig.next_game_point ? 'success' : 'default'"
+                            >
+                                {{ autoConfig.next_game_point ? "已标定" : "未标定" }}
+                            </n-tag>
+                            <n-button size="tiny" @click="calibratePoint('next_game')">标定</n-button>
+                        </n-space>
+                    </n-form-item>
+                    <n-form-item label="自动开下一局" feedback="认输后自动点「开始下一局」">
+                        <n-switch
+                            v-model:value="autoConfig.auto_next_game"
+                            @update:value="setAutoNextGame"
+                        />
                     </n-form-item>
                 </n-form>
             </n-drawer-content>

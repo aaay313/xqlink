@@ -94,8 +94,9 @@ pub fn run() {
             config::set_auto_input_mode,
             config::set_auto_resign_limit,
             config::reset_resign_count,
-            config::calibrate_resign_point,
-            config::clear_resign_point,
+            config::calibrate_point,
+            config::clear_auto_points,
+            config::set_auto_next_game,
             config::capture_cursor_pos,
         ])
         .run(tauri::generate_context!())

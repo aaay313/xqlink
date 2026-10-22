@@ -35,9 +35,18 @@ pub struct AutoConfig {
     pub auto_resign_limit: u32,
     /// 已自动认输的把数（持久化）。
     pub resign_count: u32,
-    /// 「认输」按钮在客户区**图像像素**中的坐标（由界面标定写入）。
-    /// None = 尚未标定。
-    pub resign_point: Option<(i32, i32)>,
+    /// 认输**第一步**：JJ 象棋底部工具栏里「投降」入口的位置（点它弹出工具菜单）。
+    ///
+    /// 坐标是客户区**图像像素**（界面标定写入）。None = 未标定。
+    pub resign_menu_point: Option<(i32, i32)>,
+    /// 认输**第二步**：弹出菜单里「退出 / 投降」按钮的位置。
+    pub resign_confirm_point: Option<(i32, i32)>,
+    /// 认输**第三步**：确认弹窗（"退出将判负，确定要退出吗？"）里的「退出」按钮。
+    pub resign_dialog_point: Option<(i32, i32)>,
+    /// 对局结束后「开始下一局」按钮的位置。
+    pub next_game_point: Option<(i32, i32)>,
+    /// 认输后是否自动开始下一局。
+    pub auto_next_game: bool,
 }
 
 impl Default for AutoConfig {
@@ -48,7 +57,11 @@ impl Default for AutoConfig {
             input_mode: crate::auto::InputMode::default(),
             auto_resign_limit: 0,
             resign_count: 0,
-            resign_point: None,
+            resign_menu_point: None,
+            resign_confirm_point: None,
+            resign_dialog_point: None,
+            next_game_point: None,
+            auto_next_game: true,
         }
     }
 }
@@ -284,12 +297,17 @@ pub async fn reset_resign_count() {
     debug!("reset_resign_count");
 }
 
-/// 标定「认输」按钮：读取当前鼠标位置，换算成目标窗口客户区图像坐标后保存。
+/// 标定界面上的某个按钮位置：读取当前鼠标位置，换算成客户区图像坐标后保存。
 ///
-/// 存的是**客户区坐标**而非屏幕坐标 —— 这样窗口移动、分辨率变化后
-/// 依然能准确定位按钮。调用前请先把鼠标移到 JJ 象棋的「认输」按钮上。
+/// `target` 取值：
+/// - `resign_menu`    —— 认输第一步：底部工具栏的「投降」入口（点它弹出菜单）
+/// - `resign_confirm` —— 认输第二步：弹出菜单里的「退出 / 投降」
+/// - `resign_dialog`  —— 认输第三步：确认弹窗里的「退出」
+/// - `next_game`      —— 对局结束后的「开始下一局」
+///
+/// 存的是**客户区坐标**而非屏幕坐标 —— 窗口移动、分辨率变化后依然准确。
 #[tauri::command]
-pub async fn calibrate_resign_point() -> Result<(i32, i32), String> {
+pub async fn calibrate_point(target: String) -> Result<(i32, i32), String> {
     let (sx, sy) = crate::auto::cursor_position().ok_or("无法读取鼠标位置")?;
     let state = SHARED_STATE.get().ok_or("程序尚未初始化")?;
     let frame = state
@@ -302,20 +320,42 @@ pub async fn calibrate_resign_point() -> Result<(i32, i32), String> {
     let cx = ((sx - ox) as f32 * scale).round() as i32;
     let cy = ((sy - oy) as f32 * scale).round() as i32;
     let mut config = state.config.write().unwrap();
-    config.auto.resign_point = Some((cx, cy));
+    match target.as_str() {
+        "resign_menu" => config.auto.resign_menu_point = Some((cx, cy)),
+        "resign_confirm" => config.auto.resign_confirm_point = Some((cx, cy)),
+        "resign_dialog" => config.auto.resign_dialog_point = Some((cx, cy)),
+        "next_game" => config.auto.next_game_point = Some((cx, cy)),
+        other => return Err(format!("未知的标定目标: {other}")),
+    }
     config.save();
-    debug!("calibrate_resign_point: screen({},{}) -> client({},{})", sx, sy, cx, cy);
+    debug!(
+        "calibrate_point {}: screen({},{}) -> client({},{})",
+        target, sx, sy, cx, cy
+    );
     Ok((cx, cy))
 }
 
-/// 清除已标定的「认输」按钮位置。
+/// 清除所有已标定的按钮位置。
 #[tauri::command]
-pub async fn clear_resign_point() {
+pub async fn clear_auto_points() {
     let state = SHARED_STATE.get().unwrap();
     let mut config = state.config.write().unwrap();
-    config.auto.resign_point = None;
+    config.auto.resign_menu_point = None;
+    config.auto.resign_confirm_point = None;
+    config.auto.resign_dialog_point = None;
+    config.auto.next_game_point = None;
     config.save();
-    debug!("clear_resign_point");
+    debug!("clear_auto_points");
+}
+
+/// 开关「认输后自动开始下一局」。
+#[tauri::command]
+pub async fn set_auto_next_game(enabled: bool) {
+    let state = SHARED_STATE.get().unwrap();
+    let mut config = state.config.write().unwrap();
+    config.auto.auto_next_game = enabled;
+    config.save();
+    debug!("set_auto_next_game: {}", enabled);
 }
 
 /// 读取当前鼠标的屏幕绝对坐标（标定流程用）。

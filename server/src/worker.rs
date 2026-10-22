@@ -88,14 +88,29 @@ struct AnalysisContext {
     last_camp: Option<chess::Camp>,
     /// 棋格级多帧投票器，用于过滤单帧偶发误判
     voter: BoardVoter,
-    /// 已自动走过的盘面。自动走棋后盘面会变，用它避免同一局面被重复点击。
-    auto_moved_board: Option<[[char; 9]; 10]>,
+    /// 自动走棋的尝试记录。
+    ///
+    /// 不能用"一次走完就永久记住这个盘面"来去重：若那次点击没生效，
+    /// 盘面不会变化，状态机就不再分析，于是该局面被永久跳过 ——
+    /// 表现就是"开了自动下棋但有时不走"。改按"时间窗 + 重试次数"控制。
+    auto_attempt: Option<AutoAttempt>,
     /// 本把是否已经执行过自动认输。防止同一把里反复点认输。
     resigned_this_game: bool,
-    /// 当前的输入通道是否已验证有效（验证过就不再每次等待确认）。
-    input_verified: bool,
     /// 窗口消息方式对本程序无效（自绘 + 原始输入）→ 永久改用系统输入。
     message_input_broken: bool,
+}
+
+/// 一次自动走棋尝试的状态。
+#[derive(Clone, Copy)]
+struct AutoAttempt {
+    /// 尝试时的盘面（用于判断是否还是同一局面）
+    board: [[char; 9]; 10],
+    /// 本次使用的输入通道
+    input: auto::InputMode,
+    /// 针对该盘面已尝试的次数
+    tries: u32,
+    /// 上次尝试的时间
+    at: std::time::Instant,
 }
 
 unsafe impl Send for AnalysisContext {}
@@ -118,9 +133,8 @@ impl AnalysisContext {
             last_ui_fen: String::new(),
             last_camp: None,
             voter: BoardVoter::new(),
-            auto_moved_board: None,
+            auto_attempt: None,
             resigned_this_game: false,
-            input_verified: false,
             message_input_broken: false,
         }
     }
@@ -257,17 +271,6 @@ impl AnalysisContext {
         })
     }
 
-    /// 重新识别一次，比对盘面是否已变化 —— 用于验证自动走棋是否真的生效。
-    fn board_changed_from(&self, before: [[char; 9]; 10]) -> bool {
-        let Some(image) = self.window.capture() else {
-            return false;
-        };
-        match get_board(image) {
-            Some((_, board, _)) => board != before,
-            None => false,
-        }
-    }
-
     /// 刷新共享状态里的窗口几何 —— 标定「认输」按钮位置时要把屏幕坐标
     /// 换算成客户区坐标，窗口被移动/缩放后必须跟着更新。
     fn refresh_auto_frame(&self) {
@@ -282,15 +285,21 @@ impl AnalysisContext {
 
     /// 自动走棋：把引擎建议的着法换算成屏幕坐标并输入。
     ///
-    /// 输入通道优先用**窗口消息**（完全不移动鼠标指针）；若目标程序不响应
-    /// （自绘 + 原始输入的引擎），首次验证发现棋盘没变化后自动降级为系统输入。
+    /// 重试策略（关键）：状态机只在**盘面变化时**才重新分析，所以一旦某次点击
+    /// 没生效（窗口消息不被响应、窗口失焦等），盘面不会变化，就不会再触发本函数
+    /// —— 表现为"开了自动下棋但有时不走"。因此这里按时间窗允许重试：
+    /// - 同一盘面每隔 `RETRY_INTERVAL` 才允许再试一次（避免分析被多次调用时连点）
+    /// - 同一通道连续试 3 次无进展 → 自动降级为系统输入
     fn try_auto_move(
         &mut self,
         camp: &chess::Camp,
         board: [[char; 9]; 10],
         expect: &chess::Changed,
     ) {
-        let (enabled, mode, input) = {
+        const RETRY_INTERVAL: Duration = Duration::from_millis(1500);
+        const DOWNGRADE_AFTER: u32 = 3;
+
+        let (enabled, mode, configured_input) = {
             let config = SHARED_STATE.get().unwrap().config.read().unwrap();
             (
                 config.auto.auto_play,
@@ -301,57 +310,83 @@ impl AnalysisContext {
         if !enabled {
             return;
         }
-        // 同一局面不重复点：分析会被多次调用（确认、投票），但只应走一次
-        if self.auto_moved_board == Some(board) {
+        if expect.from.is_empty() || expect.to.is_empty() {
             return;
         }
-        let Some(map) = self.screen_map() else { return; };
-        let Some((from_row, from_col)) = parse_iccs_pos(&expect.from) else { return; };
-        let Some((to_row, to_col)) = parse_iccs_pos(&expect.to) else { return; };
-        let from = (from_row, from_col);
-        let to = (to_row, to_col);
 
-        // 已确认窗口消息无效时，直接走系统输入
-        let mut effective = input;
-        if self.message_input_broken && effective == auto::InputMode::Auto {
+        // 决定本次用哪个通道、是否到重试时机
+        let now = std::time::Instant::now();
+        let (tries, mut effective) = match self.auto_attempt {
+            Some(att) if att.board == board => {
+                if now.duration_since(att.at) < RETRY_INTERVAL {
+                    return; // 距离上次尝试太近，等下一轮
+                }
+                let tries = att.tries + 1;
+                let mut eff = att.input;
+                if eff != auto::InputMode::SendInput && tries >= DOWNGRADE_AFTER {
+                    warn!(
+                        "自动走棋 {:?} 连续 {} 次未生效，改用系统输入",
+                        eff, tries
+                    );
+                    eff = auto::InputMode::SendInput;
+                    self.message_input_broken = true;
+                }
+                (tries, eff)
+            }
+            _ => (0, configured_input),
+        };
+        // 已确认窗口消息无效 → 一律用系统输入
+        if self.message_input_broken && effective != auto::InputMode::SendInput {
             effective = auto::InputMode::SendInput;
         }
 
-        // 系统输入必须让目标窗口在前台，否则点击会落到当前活动的其它窗口；
-        // 窗口消息是直接发给目标窗口的，不需要抢焦点。
+        let Some(map) = self.screen_map() else { return; };
+        let Some((from_row, from_col)) = parse_iccs_pos(&expect.from) else { return; };
+        let Some((to_row, to_col)) = parse_iccs_pos(&expect.to) else { return; };
+
+        // 记录本次尝试（先记，失败也能在下一轮按时间窗重试）
+        self.auto_attempt = Some(AutoAttempt {
+            board,
+            input: effective,
+            tries,
+            at: now,
+        });
+
+        // 系统输入必须让目标窗口在前台；窗口消息直接发给目标窗口，不必抢焦点
         if effective == auto::InputMode::SendInput {
             auto::focus_window(self.window.hwnd());
         }
 
-        if !auto::play_move(&map, camp, from, to, mode, effective) {
+        let ok = auto::play_move(
+            &map,
+            camp,
+            (from_row, from_col),
+            (to_row, to_col),
+            mode,
+            effective,
+        );
+        if ok {
+            info!(
+                "自动走棋（第 {} 次，{:?}）: {} -> {}",
+                tries + 1,
+                effective,
+                expect.from,
+                expect.to
+            );
+        } else {
             warn!("自动走棋输入失败: {} -> {}", expect.from, expect.to);
-            return;
         }
-        info!("自动走棋: {} -> {}（{:?}）", expect.from, expect.to, effective);
-        self.auto_moved_board = Some(board);
+    }
 
-        // 首次使用该通道时验证是否真的生效（验证过之后不再等待，省时间）
-        if self.input_verified {
+    /// 自动走棋兜底：盘面长时间没变化时按时间窗重试一次。
+    ///
+    /// 必须由「棋盘未发生变化」的分支调用 —— 那正是点击没生效后程序停住的地方。
+    fn retry_auto_move(&mut self, camp: &chess::Camp, board: [[char; 9]; 10]) {
+        if !self.our_turn {
             return;
         }
-        std::thread::sleep(Duration::from_millis(600));
-        if self.board_changed_from(board) {
-            self.input_verified = true;
-            return;
-        }
-        // 棋盘没变化 → 该通道无效
-        if effective != auto::InputMode::SendInput {
-            warn!("窗口消息方式未生效（棋盘无变化），降级为系统输入重试");
-            self.message_input_broken = true;
-            auto::focus_window(self.window.hwnd());
-            if auto::play_move(&map, camp, from, to, mode, auto::InputMode::SendInput) {
-                std::thread::sleep(Duration::from_millis(600));
-                if self.board_changed_from(board) {
-                    info!("系统输入方式已生效");
-                }
-            }
-        }
-        self.input_verified = true;
+        let expect = self.expect_move.clone();
+        self.try_auto_move(camp, board, &expect);
     }
 
     /// 本把是否需要自动认输：认输额度尚未用完。
@@ -364,36 +399,103 @@ impl AnalysisContext {
         limit > 0 && config.auto.resign_count < limit
     }
 
-    /// 执行自动认输：点击已标定的「认输」按钮，并消耗一次认输额度。
+    /// 执行自动认输。
+    ///
+    /// JJ 象棋的退出/投降是**三步**，缺一步就停在中间：
+    /// 1. 点底部工具栏的入口展开菜单
+    /// 2. 点菜单里的「退出 / 投降」
+    /// 3. 确认弹窗「退出将判负，确定要退出吗？」里点「退出」
+    ///
+    /// 对局结束、结算界面出现后，若开启了「自动开始下一局」再点一次。
     fn do_resign(&mut self) {
+        /// 结算动画与「开始下一局」按钮出现的等待时间。
+        const SETTLE_WAIT: Duration = Duration::from_millis(3000);
+        /// 展开菜单到菜单项可点的等待时间。
+        const MENU_WAIT: Duration = Duration::from_millis(400);
+        /// 点菜单项到确认弹窗出现的等待时间。
+        const DIALOG_WAIT: Duration = Duration::from_millis(600);
+
         let state = SHARED_STATE.get().unwrap();
-        let (limit, count, point) = {
+        let (limit, count, menu_pt, confirm_pt, dialog_pt, next_pt, auto_next) = {
             let config = state.config.read().unwrap();
             (
                 config.auto.auto_resign_limit,
                 config.auto.resign_count,
-                config.auto.resign_point,
+                config.auto.resign_menu_point,
+                config.auto.resign_confirm_point,
+                config.auto.resign_dialog_point,
+                config.auto.next_game_point,
+                config.auto.auto_next_game,
             )
         };
-        let Some((rx, ry)) = point else {
-            warn!("需要自动认输，但尚未标定「认输」按钮位置（设置面板里点「标定认输按钮」）");
+        let Some(map) = self.screen_map() else { return; };
+
+        // 标定存的是客户区图像坐标 → 屏幕绝对坐标
+        let to_screen = |p: (i32, i32)| -> (i32, i32) {
+            (
+                (map.origin.0 as f32 + p.0 as f32 / map.scale).round() as i32,
+                (map.origin.1 as f32 + p.1 as f32 / map.scale).round() as i32,
+            )
+        };
+
+        // 第一步：展开底部工具菜单
+        let Some(menu) = menu_pt else {
+            warn!("尚未标定认输第一步（底部「投降」入口），跳过自动认输");
             return;
         };
-        let Some(map) = self.screen_map() else { return; };
-        let (ox, oy) = map.origin;
-        let scale = map.scale;
-
+        let (mx, my) = to_screen(menu);
         auto::focus_window(self.window.hwnd());
-        // 标定存的是客户区图像像素 → 屏幕绝对坐标
-        let sx = (ox as f32 + rx as f32 / scale).round() as i32;
-        let sy = (oy as f32 + ry as f32 / scale).round() as i32;
-        if auto::click_at(sx, sy) {
+        if !auto::click_at(mx, my) {
+            warn!("认输第一步（展开菜单）点击失败");
+            return;
+        }
+        thread::sleep(MENU_WAIT);
+
+        // 第二步：点菜单里的「退出 / 投降」
+        let Some(confirm) = confirm_pt else {
+            warn!("尚未标定认输第二步（菜单里的「退出/投降」），跳过自动认输");
+            return;
+        };
+        let (cx, cy) = to_screen(confirm);
+        if !auto::click_at(cx, cy) {
+            warn!("认输第二步（菜单项）点击失败");
+            return;
+        }
+
+        // 第三步：确认弹窗点「退出」（弹窗文案："退出将判负，确定要退出吗？"）
+        if let Some(dialog) = dialog_pt {
+            thread::sleep(DIALOG_WAIT);
+            let (dx, dy) = to_screen(dialog);
+            if !auto::click_at(dx, dy) {
+                warn!("认输第三步（确认弹窗「退出」）点击失败");
+            }
+        } else {
+            warn!("尚未标定认输第三步（确认弹窗的「退出」），可能会停在确认框上");
+        }
+
+        // 记录一次认输额度
+        {
             let mut config = state.config.write().unwrap();
             config.auto.resign_count = count + 1;
             config.save();
-            info!("已自动认输（{}/{} 把）", count + 1, limit);
-        } else {
-            warn!("自动认输点击失败");
+        }
+        info!("已自动认输（{}/{} 把）", count + 1, limit);
+
+        // 第四步（可选）：结算界面出现后开始下一局
+        if auto_next {
+            match next_pt {
+                Some(p) => {
+                    thread::sleep(SETTLE_WAIT);
+                    let (x, y) = to_screen(p);
+                    auto::focus_window(self.window.hwnd());
+                    if auto::click_at(x, y) {
+                        info!("已自动开始下一局");
+                    } else {
+                        warn!("「开始下一局」点击失败");
+                    }
+                }
+                None => warn!("已开启自动开下一局，但尚未标定「开始下一局」按钮"),
+            }
         }
     }
 
@@ -1166,6 +1268,9 @@ fn process_analysis_loop(mut context: AnalysisContext) {
             ChessboardState::OurTurn | ChessboardState::OpponentTurn | ChessboardState::Idle => {
                 // 判断棋盘是否未发生变化
                 if board == context.last_board {
+                    // 兜底重试自动走棋：点击没生效时盘面不会变，
+                    // 这里是唯一还能再试一次的时机（内部按时间窗限流）。
+                    context.retry_auto_move(&camp, board);
                     debug!("棋盘未发生变化，跳过分析");
                     current_state // 保持当前状态
                 } else if board == context.expect_board {
