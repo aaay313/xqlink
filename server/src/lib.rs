@@ -91,6 +91,7 @@ pub fn run() {
             config::get_auto_config,
             config::set_auto_play,
             config::set_auto_play_mode,
+            config::set_auto_input_mode,
             config::set_auto_resign_limit,
             config::reset_resign_count,
             config::calibrate_resign_point,

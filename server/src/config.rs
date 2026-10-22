@@ -21,6 +21,11 @@ pub struct AutoConfig {
     pub auto_play: bool,
     /// 走子方式：点起点→点终点（JJ 象棋），或按住拖拽。
     pub play_mode: PlayMode,
+    /// 输入通道：
+    /// - `auto` —— 先用窗口消息（不动鼠标），无响应则自动降级为系统输入
+    /// - `message` —— 只用窗口消息，完全不移动鼠标指针
+    /// - `sendinput` —— 只用系统输入（兼容性最好，点了会把指针放回原处）
+    pub input_mode: crate::auto::InputMode,
     /// **最多**自动认输多少把（0 = 不自动认输）。
     ///
     /// 语义是"认输额度"：设成 3 表示程序自动下棋时，前 3 把会在
@@ -40,6 +45,7 @@ impl Default for AutoConfig {
         Self {
             auto_play: false,
             play_mode: PlayMode::default(),
+            input_mode: crate::auto::InputMode::default(),
             auto_resign_limit: 0,
             resign_count: 0,
             resign_point: None,
@@ -243,6 +249,16 @@ pub async fn set_auto_play_mode(mode: PlayMode) {
     config.auto.play_mode = mode;
     config.save();
     debug!("set_auto_play_mode: {:?}", mode);
+}
+
+/// 设置输入通道（自动 / 窗口消息 / 系统输入）。
+#[tauri::command]
+pub async fn set_auto_input_mode(mode: crate::auto::InputMode) {
+    let state = SHARED_STATE.get().unwrap();
+    let mut config = state.config.write().unwrap();
+    config.auto.input_mode = mode;
+    config.save();
+    debug!("set_auto_input_mode: {:?}", mode);
 }
 
 /// 设置「最多自动认输多少把」（0 = 不自动认输）。

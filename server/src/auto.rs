@@ -63,6 +63,7 @@ mod ffi {
         pub fn GetCursorPos(pt: *mut Point) -> i32;
         pub fn SetForegroundWindow(hwnd: *mut c_void) -> i32;
         pub fn ShowWindow(hwnd: *mut c_void, cmd: i32) -> i32;
+        pub fn PostMessageW(hwnd: *mut c_void, msg: u32, wparam: usize, lparam: isize) -> i32;
     }
 
     #[repr(C)]
@@ -74,6 +75,11 @@ mod ffi {
 
     /// SW_RESTORE —— 目标窗口最小化时先还原，否则点击不会落到它身上。
     pub const SW_RESTORE: i32 = 9;
+
+    pub const WM_MOUSEMOVE: u32 = 0x0200;
+    pub const WM_LBUTTONDOWN: u32 = 0x0201;
+    pub const WM_LBUTTONUP: u32 = 0x0202;
+    pub const MK_LBUTTON: usize = 0x0001;
 }
 
 #[cfg(target_os = "windows")]
@@ -108,17 +114,22 @@ pub struct ScreenMap {
     pub scale: f32,
     /// 棋盘裁剪区（客户区图像坐标）：(x, y, w, h)
     pub board_rect: (u32, u32, u32, u32),
+    /// 目标窗口句柄（窗口消息方式需要）。
+    pub hwnd: u32,
 }
 
 impl ScreenMap {
-    /// 把「红方在下」视角的棋盘坐标 (row, col) 换算成屏幕绝对坐标。
+    /// 把「红方在下」视角的棋盘坐标 (row, col) 换算成**客户区物理坐标**。
     ///
     /// 两步变换：
     /// 1. board 数组恒为「红方在下」视角（`chess::board_fix` 已按 camp 翻转过），
     ///    而裁剪区图像是屏幕方向 —— 黑方在下时行列都要反。
     /// 2. 裁剪区是「棋盘框 ± 半格」，故棋盘框在裁剪区内占 10 格宽 / 11 格高，
     ///    格子 col 的中心位于 `w * (col + 1) / 10`。
-    pub fn board_to_screen(&self, camp: &Camp, row: usize, col: usize) -> Option<(i32, i32)> {
+    ///
+    /// 客户区物理坐标是 `PostMessage` 的 lParam 需要的量（消息坐标是
+    /// 客户区坐标，不是屏幕坐标）。
+    pub fn board_to_client(&self, camp: &Camp, row: usize, col: usize) -> Option<(i32, i32)> {
         if self.scale <= 0.0 {
             return None;
         }
@@ -133,13 +144,31 @@ impl ScreenMap {
         // 裁剪区内的像素位置
         let px = bw as f32 * (img_col as f32 + 1.0) / 10.0;
         let py = bh as f32 * (img_row as f32 + 1.0) / 11.0;
-        // → 客户区图像坐标 → 客户区物理坐标 → 屏幕绝对坐标
-        let cx = bx as f32 + px;
-        let cy = by as f32 + py;
-        let sx = self.origin.0 as f32 + cx / self.scale;
-        let sy = self.origin.1 as f32 + cy / self.scale;
-        Some((sx.round() as i32, sy.round() as i32))
+        // → 客户区图像坐标 → 客户区物理坐标
+        let cx = (bx as f32 + px) / self.scale;
+        let cy = (by as f32 + py) / self.scale;
+        Some((cx.round() as i32, cy.round() as i32))
     }
+
+    /// 把棋盘坐标换算成屏幕绝对坐标（`SendInput` / `SetCursorPos` 用）。
+    pub fn board_to_screen(&self, camp: &Camp, row: usize, col: usize) -> Option<(i32, i32)> {
+        let (cx, cy) = self.board_to_client(camp, row, col)?;
+        Some((self.origin.0 + cx, self.origin.1 + cy))
+    }
+}
+
+/// 输入方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum InputMode {
+    /// 自动：先试窗口消息（不动鼠标），棋盘无反应则降级为系统输入。
+    #[default]
+    Auto,
+    /// 仅用窗口消息（`PostMessage`）—— **完全不移动鼠标指针**。
+    /// 前提是目标程序用标准 Win32 消息处理点击；自绘 + 原始输入的游戏可能不响应。
+    Message,
+    /// 仅用系统输入（`SendInput`）—— 真实鼠标事件，兼容性最好，但会移动指针。
+    SendInput,
 }
 
 /// 读取当前鼠标位置（屏幕绝对坐标）。用于标定「认输」按钮位置。
@@ -200,6 +229,58 @@ pub fn click_at(_x: i32, _y: i32) -> bool {
     false
 }
 
+/// 通过**窗口消息**点击客户区坐标 —— 完全不移动鼠标指针。
+///
+/// 直接给目标窗口发 `WM_LBUTTONDOWN/UP`，坐标是客户区物理坐标
+/// （消息坐标属于客户区，不是屏幕坐标）。
+///
+/// 优点：不干扰用户正在使用的鼠标，也不必把窗口抢到前台。
+/// 限制：目标程序须用标准 Win32 消息处理点击；若是自绘 + 原始输入
+/// （DirectInput 等）则不会响应 —— 此时需退回 `SendInput`。
+#[cfg(target_os = "windows")]
+pub fn post_click(hwnd: u32, client_x: i32, client_y: i32) -> bool {
+    if hwnd == 0 {
+        return false;
+    }
+    // lParam = (y << 16) | x，均为 16 位有符号的客户区坐标
+    let lp = (((client_y as u32) & 0xFFFF) << 16) | ((client_x as u32) & 0xFFFF);
+    unsafe {
+        let h = hwnd as *mut std::ffi::c_void;
+        // 先发移动消息：不少程序靠鼠标移动维护 hover/选中态
+        ffi::PostMessageW(h, ffi::WM_MOUSEMOVE, 0, lp as isize);
+        sleep(Duration::from_millis(25));
+        ffi::PostMessageW(h, ffi::WM_LBUTTONDOWN, ffi::MK_LBUTTON, lp as isize);
+        sleep(Duration::from_millis(40));
+        ffi::PostMessageW(h, ffi::WM_LBUTTONUP, 0, lp as isize);
+    }
+    true
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn post_click(_hwnd: u32, _client_x: i32, _client_y: i32) -> bool {
+    false
+}
+
+/// 点击屏幕坐标，**点完把鼠标指针放回原处**。
+///
+/// 系统输入方式无法避免移动指针，但可以"用完即还"，用户基本不被打断。
+#[cfg(target_os = "windows")]
+pub fn click_at_restoring(x: i32, y: i32) -> bool {
+    let saved = cursor_position();
+    let ok = click_at(x, y);
+    if let Some((sx, sy)) = saved {
+        unsafe {
+            ffi::SetCursorPos(sx, sy);
+        }
+    }
+    ok
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn click_at_restoring(_x: i32, _y: i32) -> bool {
+    false
+}
+
 /// 从 (fx, fy) 拖拽到 (tx, ty)。
 #[cfg(target_os = "windows")]
 pub fn drag_from_to(fx: i32, fy: i32, tx: i32, ty: i32, steps: u32) -> bool {
@@ -233,24 +314,59 @@ pub fn drag_from_to(_fx: i32, _fy: i32, _tx: i32, _ty: i32, _steps: u32) -> bool
 }
 
 /// 按给定方式走一步棋。
-pub fn play_move(map: &ScreenMap, camp: &Camp, from: (usize, usize), to: (usize, usize), mode: PlayMode) -> bool {
-    let (fx, fy) = match map.board_to_screen(camp, from.0, from.1) {
-        Some(p) => p,
-        None => return false,
-    };
-    let (tx, ty) = match map.board_to_screen(camp, to.0, to.1) {
-        Some(p) => p,
-        None => return false,
-    };
+///
+/// `input` 决定输入通道：
+/// - `Message` —— 窗口消息，不动鼠标指针
+/// - `SendInput` —— 系统输入，兼容性最好，点了会把指针放回原处
+/// - `Auto` —— 先按 `Message` 发（不动鼠标）；是否真的生效由调用方
+///   检查盘面变化后决定是否降级
+pub fn play_move(
+    map: &ScreenMap,
+    camp: &Camp,
+    from: (usize, usize),
+    to: (usize, usize),
+    mode: PlayMode,
+    input: InputMode,
+) -> bool {
     match mode {
-        PlayMode::Click => {
-            if !click_at(fx, fy) {
-                return false;
+        PlayMode::Click => match input {
+            InputMode::Message | InputMode::Auto => {
+                let Some((fcx, fcy)) = map.board_to_client(camp, from.0, from.1) else {
+                    return false;
+                };
+                let Some((tcx, tcy)) = map.board_to_client(camp, to.0, to.1) else {
+                    return false;
+                };
+                if !post_click(map.hwnd, fcx, fcy) {
+                    return false;
+                }
+                sleep(Duration::from_millis(220));
+                post_click(map.hwnd, tcx, tcy)
             }
-            sleep(Duration::from_millis(220));
-            click_at(tx, ty)
+            InputMode::SendInput => {
+                let Some((fx, fy)) = map.board_to_screen(camp, from.0, from.1) else {
+                    return false;
+                };
+                let Some((tx, ty)) = map.board_to_screen(camp, to.0, to.1) else {
+                    return false;
+                };
+                if !click_at_restoring(fx, fy) {
+                    return false;
+                }
+                sleep(Duration::from_millis(220));
+                click_at_restoring(tx, ty)
+            }
+        },
+        PlayMode::Drag => {
+            // 拖拽依赖连续的移动轨迹，窗口消息难以还原，只走系统输入
+            let Some((fx, fy)) = map.board_to_screen(camp, from.0, from.1) else {
+                return false;
+            };
+            let Some((tx, ty)) = map.board_to_screen(camp, to.0, to.1) else {
+                return false;
+            };
+            drag_from_to(fx, fy, tx, ty, 12)
         }
-        PlayMode::Drag => drag_from_to(fx, fy, tx, ty, 12),
     }
 }
 
@@ -269,7 +385,15 @@ mod tests {
             origin: (100, 200),
             scale: 1.0,
             board_rect: (10, 20, 300, 330),
+            hwnd: 0,
         }
+    }
+
+    #[test]
+    fn board_to_client_uses_client_coordinates() {
+        // 客户区坐标不含屏幕原点 —— PostMessage 的 lParam 用的就是它
+        let (x, y) = map().board_to_client(&Camp::Red, 0, 0).unwrap();
+        assert_eq!((x, y), (40, 50));
     }
 
     #[test]

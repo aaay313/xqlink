@@ -92,6 +92,10 @@ struct AnalysisContext {
     auto_moved_board: Option<[[char; 9]; 10]>,
     /// 本把是否已经执行过自动认输。防止同一把里反复点认输。
     resigned_this_game: bool,
+    /// 当前的输入通道是否已验证有效（验证过就不再每次等待确认）。
+    input_verified: bool,
+    /// 窗口消息方式对本程序无效（自绘 + 原始输入）→ 永久改用系统输入。
+    message_input_broken: bool,
 }
 
 unsafe impl Send for AnalysisContext {}
@@ -116,6 +120,8 @@ impl AnalysisContext {
             voter: BoardVoter::new(),
             auto_moved_board: None,
             resigned_this_game: false,
+            input_verified: false,
+            message_input_broken: false,
         }
     }
 
@@ -247,7 +253,19 @@ impl AnalysisContext {
             origin: self.window.client_origin(),
             scale: self.window.scale_factor(),
             board_rect: (x, y, w, h),
+            hwnd: self.window.hwnd(),
         })
+    }
+
+    /// 重新识别一次，比对盘面是否已变化 —— 用于验证自动走棋是否真的生效。
+    fn board_changed_from(&self, before: [[char; 9]; 10]) -> bool {
+        let Some(image) = self.window.capture() else {
+            return false;
+        };
+        match get_board(image) {
+            Some((_, board, _)) => board != before,
+            None => false,
+        }
     }
 
     /// 刷新共享状态里的窗口几何 —— 标定「认输」按钮位置时要把屏幕坐标
@@ -262,16 +280,23 @@ impl AnalysisContext {
         }
     }
 
-    /// 自动走棋：把引擎建议的着法换算成屏幕坐标并点击。
+    /// 自动走棋：把引擎建议的着法换算成屏幕坐标并输入。
+    ///
+    /// 输入通道优先用**窗口消息**（完全不移动鼠标指针）；若目标程序不响应
+    /// （自绘 + 原始输入的引擎），首次验证发现棋盘没变化后自动降级为系统输入。
     fn try_auto_move(
         &mut self,
         camp: &chess::Camp,
         board: [[char; 9]; 10],
         expect: &chess::Changed,
     ) {
-        let (enabled, mode) = {
+        let (enabled, mode, input) = {
             let config = SHARED_STATE.get().unwrap().config.read().unwrap();
-            (config.auto.auto_play, config.auto.play_mode)
+            (
+                config.auto.auto_play,
+                config.auto.play_mode,
+                config.auto.input_mode,
+            )
         };
         if !enabled {
             return;
@@ -283,15 +308,50 @@ impl AnalysisContext {
         let Some(map) = self.screen_map() else { return; };
         let Some((from_row, from_col)) = parse_iccs_pos(&expect.from) else { return; };
         let Some((to_row, to_col)) = parse_iccs_pos(&expect.to) else { return; };
+        let from = (from_row, from_col);
+        let to = (to_row, to_col);
 
-        // 目标窗口必须在前台，否则点击会落到当前活动的其它窗口上
-        auto::focus_window(self.window.hwnd());
-        if auto::play_move(&map, camp, (from_row, from_col), (to_row, to_col), mode) {
-            info!("自动走棋: {} -> {}", expect.from, expect.to);
-            self.auto_moved_board = Some(board);
-        } else {
-            warn!("自动走棋失败: {} -> {}", expect.from, expect.to);
+        // 已确认窗口消息无效时，直接走系统输入
+        let mut effective = input;
+        if self.message_input_broken && effective == auto::InputMode::Auto {
+            effective = auto::InputMode::SendInput;
         }
+
+        // 系统输入必须让目标窗口在前台，否则点击会落到当前活动的其它窗口；
+        // 窗口消息是直接发给目标窗口的，不需要抢焦点。
+        if effective == auto::InputMode::SendInput {
+            auto::focus_window(self.window.hwnd());
+        }
+
+        if !auto::play_move(&map, camp, from, to, mode, effective) {
+            warn!("自动走棋输入失败: {} -> {}", expect.from, expect.to);
+            return;
+        }
+        info!("自动走棋: {} -> {}（{:?}）", expect.from, expect.to, effective);
+        self.auto_moved_board = Some(board);
+
+        // 首次使用该通道时验证是否真的生效（验证过之后不再等待，省时间）
+        if self.input_verified {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(600));
+        if self.board_changed_from(board) {
+            self.input_verified = true;
+            return;
+        }
+        // 棋盘没变化 → 该通道无效
+        if effective != auto::InputMode::SendInput {
+            warn!("窗口消息方式未生效（棋盘无变化），降级为系统输入重试");
+            self.message_input_broken = true;
+            auto::focus_window(self.window.hwnd());
+            if auto::play_move(&map, camp, from, to, mode, auto::InputMode::SendInput) {
+                std::thread::sleep(Duration::from_millis(600));
+                if self.board_changed_from(board) {
+                    info!("系统输入方式已生效");
+                }
+            }
+        }
+        self.input_verified = true;
     }
 
     /// 本把是否需要自动认输：认输额度尚未用完。

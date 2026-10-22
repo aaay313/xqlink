@@ -520,6 +520,8 @@ async function getEngineConfig() {
 interface AutoConfig {
     auto_play: boolean;
     play_mode: "click" | "drag";
+    /** 输入通道：auto / message / sendinput */
+    input_mode: "auto" | "message" | "sendinput";
     /** 最多自动认输多少把（0 = 不认输） */
     auto_resign_limit: number;
     /** 已自动认输的把数 */
@@ -531,6 +533,7 @@ interface AutoConfig {
 const autoConfig = ref<AutoConfig>({
     auto_play: false,
     play_mode: "click",
+    input_mode: "auto",
     auto_resign_limit: 0,
     resign_count: 0,
     resign_point: null,
@@ -543,6 +546,12 @@ const playModeOptions = [
     { label: "按住拖拽", value: "drag" },
 ];
 
+const inputModeOptions = [
+    { label: "自动（不动鼠标，无效则降级）", value: "auto" },
+    { label: "仅窗口消息（完全不移动鼠标）", value: "message" },
+    { label: "仅系统输入（兼容性最好）", value: "sendinput" },
+];
+
 async function getAutoConfig() {
     autoConfig.value = await invoke("get_auto_config");
 }
@@ -553,6 +562,10 @@ async function setAutoPlay() {
 
 async function setAutoPlayMode() {
     await invoke("set_auto_play_mode", { mode: autoConfig.value.play_mode });
+}
+
+async function setAutoInputMode() {
+    await invoke("set_auto_input_mode", { mode: autoConfig.value.input_mode });
 }
 
 async function setAutoResignLimit() {
@@ -784,6 +797,16 @@ async function toggleEngine() {
                             v-model:value="autoConfig.play_mode"
                             :options="playModeOptions"
                             @update:value="setAutoPlayMode"
+                        />
+                    </n-form-item>
+                    <n-form-item
+                        label="输入通道"
+                        feedback="窗口消息不移动鼠标；若象棋无响应会自动改用系统输入"
+                    >
+                        <n-select
+                            v-model:value="autoConfig.input_mode"
+                            :options="inputModeOptions"
+                            @update:value="setAutoInputMode"
                         />
                     </n-form-item>
 
