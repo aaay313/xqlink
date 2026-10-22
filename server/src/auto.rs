@@ -64,6 +64,9 @@ mod ffi {
         pub fn SetForegroundWindow(hwnd: *mut c_void) -> i32;
         pub fn ShowWindow(hwnd: *mut c_void, cmd: i32) -> i32;
         pub fn PostMessageW(hwnd: *mut c_void, msg: u32, wparam: usize, lparam: isize) -> i32;
+        pub fn SendMessageW(hwnd: *mut c_void, msg: u32, wparam: usize, lparam: isize) -> isize;
+        pub fn ScreenToClient(hwnd: *mut c_void, pt: *mut Point) -> i32;
+        pub fn ClientToScreen(hwnd: *mut c_void, pt: *mut Point) -> i32;
     }
 
     #[repr(C)]
@@ -71,6 +74,82 @@ mod ffi {
     pub struct Point {
         pub x: i32,
         pub y: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct Rect {
+        pub left: i32,
+        pub top: i32,
+        pub right: i32,
+        pub bottom: i32,
+    }
+
+    /// Win32 POINTER_INFO（x64 布局）。字段顺序必须与 SDK 一致，
+    /// 否则 InjectTouchInput 会读错偏移 —— 全零初始化后只填必要字段。
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct PointerInfo {
+        pub pointer_type: i32,
+        pub pointer_id: u32,
+        pub frame_id: u32,
+        pub pointer_flags: u32,
+        pub source_device: usize,
+        pub hwnd_target: usize,
+        pub pt_pixel_location: Point,
+        pub pt_himetric_location: Point,
+        pub pt_pixel_location_raw: Point,
+        pub pt_himetric_location_raw: Point,
+        pub time: u32,
+        pub history_count: u32,
+        pub input_state: i32,
+        pub key_states: u32,
+        pub performance_count: u64,
+        pub button_change_type: i32,
+    }
+
+    impl Default for PointerInfo {
+        fn default() -> Self {
+            // SAFETY: 全部是 POD（整数与 POINT），全零是合法初值。
+            unsafe { std::mem::zeroed() }
+        }
+    }
+
+    /// Win32 POINTER_TOUCH_INFO（x64 布局）。
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct PointerTouchInfo {
+        pub pointer_info: PointerInfo,
+        pub touch_flags: u32,
+        pub touch_mask: u32,
+        pub rc_contact: Rect,
+        pub rc_contact_raw: Rect,
+        pub orientation: u32,
+        pub pressure: u32,
+    }
+
+    impl Default for PointerTouchInfo {
+        fn default() -> Self {
+            unsafe { std::mem::zeroed() }
+        }
+    }
+
+    pub const PT_TOUCH: i32 = 0x0000_0002;
+    pub const TOUCH_FLAG_NONE: u32 = 0;
+    pub const TOUCH_MASK_CONTACTAREA: u32 = 0x1;
+    pub const TOUCH_MASK_ORIENTATION: u32 = 0x2;
+    pub const TOUCH_MASK_PRESSURE: u32 = 0x4;
+    /// 无视觉反馈 —— 屏幕上不会出现"触摸圆点"。
+    pub const TOUCH_FEEDBACK_NONE: u32 = 0x3;
+    pub const POINTER_FLAG_NEW: u32 = 0x0000_0001;
+    pub const POINTER_FLAG_INRANGE: u32 = 0x0000_0002;
+    pub const POINTER_FLAG_INCONTACT: u32 = 0x0000_0004;
+    pub const POINTER_FLAG_DOWN: u32 = 0x0001_0000;
+    pub const POINTER_FLAG_UP: u32 = 0x0004_0000;
+
+    unsafe extern "system" {
+        pub fn InitializeTouchInjection(max_count: u32, feedback: u32) -> i32;
+        pub fn InjectTouchInput(count: u32, contacts: *const PointerTouchInfo) -> i32;
     }
 
     /// SW_RESTORE —— 目标窗口最小化时先还原，否则点击不会落到它身上。
@@ -151,10 +230,129 @@ impl ScreenMap {
     }
 
     /// 把棋盘坐标换算成屏幕绝对坐标（`SendInput` / `SetCursorPos` 用）。
+    ///
+    /// 优先走系统 API `ClientToScreen`：它与 `ScreenToClient` 严格互逆，
+    /// 不受进程 DPI 感知状态影响。hwnd 缺失时（如单元测试）退回按原点相加。
     pub fn board_to_screen(&self, camp: &Camp, row: usize, col: usize) -> Option<(i32, i32)> {
         let (cx, cy) = self.board_to_client(camp, row, col)?;
+        if let Some(p) = client_to_screen(self.hwnd, cx, cy) {
+            return Some(p);
+        }
         Some((self.origin.0 + cx, self.origin.1 + cy))
     }
+}
+
+/// 目标窗口的几何信息 —— 标定按钮位置时用它做坐标换算。
+#[derive(Debug, Clone, Copy)]
+pub struct AutoFrame {
+    /// 客户区左上角的屏幕坐标（物理像素）
+    pub origin: (i32, i32),
+    /// 客户区图像像素 / 物理像素（DPI 缩放比）
+    pub scale: f32,
+    /// 窗口句柄
+    pub hwnd: u32,
+}
+
+/// 触摸注入：在屏幕坐标 (x, y) 处点一下 —— **不移动鼠标指针**。
+///
+/// 走 `InjectTouchInput`（产生 `WM_POINTER` 触摸消息），与鼠标轨道无关。
+/// Chromium 在页面未绑定 touch 事件时会把触摸**合成**为鼠标点击，
+/// 因此对 QQ 小程序这类 Chromium 应用是一条可能的"不动鼠标"通路。
+///
+/// 注意：仍需目标窗口处于前台；触摸坐标是屏幕物理像素。
+#[cfg(target_os = "windows")]
+pub fn touch_tap(x: i32, y: i32) -> bool {
+    use std::sync::OnceLock;
+    static TOUCH_READY: OnceLock<bool> = OnceLock::new();
+
+    // 触摸注入需先按进程初始化一次（仅首次调用真正执行）
+    let ready = *TOUCH_READY.get_or_init(|| unsafe {
+        ffi::InitializeTouchInjection(1, ffi::TOUCH_FEEDBACK_NONE) != 0
+    });
+    if !ready {
+        return false;
+    }
+
+    let mut contact = ffi::PointerTouchInfo::default();
+    contact.pointer_info.pointer_type = ffi::PT_TOUCH;
+    contact.pointer_info.pointer_id = 0;
+    contact.pointer_info.pt_pixel_location = ffi::Point { x, y };
+    contact.pointer_info.pointer_flags =
+        ffi::POINTER_FLAG_DOWN | ffi::POINTER_FLAG_INRANGE | ffi::POINTER_FLAG_INCONTACT;
+    contact.touch_flags = ffi::TOUCH_FLAG_NONE;
+    contact.touch_mask =
+        ffi::TOUCH_MASK_CONTACTAREA | ffi::TOUCH_MASK_ORIENTATION | ffi::TOUCH_MASK_PRESSURE;
+    // 接触区域 4x4 像素，够小以免误触相邻格
+    contact.rc_contact = ffi::Rect {
+        left: x - 2,
+        top: y - 2,
+        right: x + 2,
+        bottom: y + 2,
+    };
+    contact.rc_contact_raw = contact.rc_contact;
+    contact.orientation = 90;
+    contact.pressure = 32000;
+
+    unsafe {
+        if ffi::InjectTouchInput(1, &contact) == 0 {
+            return false;
+        }
+        sleep(Duration::from_millis(60));
+        // 抬起：只需 UP 标志，压力归零
+        contact.pointer_info.pointer_flags = ffi::POINTER_FLAG_UP;
+        contact.pressure = 0;
+        ffi::InjectTouchInput(1, &contact) != 0
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn touch_tap(_x: i32, _y: i32) -> bool {
+    false
+}
+
+/// 屏幕坐标 → 客户区坐标。
+///
+/// **不要**自己算「鼠标屏幕坐标 − 窗口原点」：那要求两侧处在同一套 DPI 坐标系，
+/// 而程序不是 DPI 感知时 `GetCursorPos` 返回逻辑坐标、xcap 返回物理坐标，
+/// 相减会得到负数（实测标定结果 x 全是 -129~-168，导致认输点完全错位）。
+/// `ScreenToClient` 由系统负责一致性，且与 `ClientToScreen` 严格互逆。
+#[cfg(target_os = "windows")]
+pub fn screen_to_client(hwnd: u32, x: i32, y: i32) -> Option<(i32, i32)> {
+    if hwnd == 0 {
+        return None;
+    }
+    unsafe {
+        let mut pt = Point { x, y };
+        if ffi::ScreenToClient(hwnd as *mut std::ffi::c_void, &mut pt) == 0 {
+            return None;
+        }
+        Some((pt.x, pt.y))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn screen_to_client(_hwnd: u32, _x: i32, _y: i32) -> Option<(i32, i32)> {
+    None
+}
+
+/// 客户区坐标 → 屏幕坐标。
+#[cfg(target_os = "windows")]
+pub fn client_to_screen(hwnd: u32, x: i32, y: i32) -> Option<(i32, i32)> {
+    if hwnd == 0 {
+        return None;
+    }
+    unsafe {
+        let mut pt = Point { x, y };
+        if ffi::ClientToScreen(hwnd as *mut std::ffi::c_void, &mut pt) == 0 {
+            return None;
+        }
+        Some((pt.x, pt.y))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn client_to_screen(_hwnd: u32, _x: i32, _y: i32) -> Option<(i32, i32)> {
+    None
 }
 
 /// 输入方式。
@@ -162,13 +360,26 @@ impl ScreenMap {
 #[serde(rename_all = "lowercase")]
 pub enum InputMode {
     /// 自动：先试窗口消息（不动鼠标），棋盘无反应则降级为系统输入。
-    #[default]
     Auto,
-    /// 仅用窗口消息（`PostMessage`）—— **完全不移动鼠标指针**。
-    /// 前提是目标程序用标准 Win32 消息处理点击；自绘 + 原始输入的游戏可能不响应。
+    /// 仅用窗口消息（`SendMessage`）—— **完全不移动鼠标指针**。
+    ///
+    /// 只对用标准 Win32 消息处理点击的程序有效。
+    /// **对 Chromium / Electron / QQ 小程序 / WebView 一律无效** ——
+    /// 它们的输入由浏览器进程经 IPC 转发给渲染进程，不读窗口消息。
     Message,
-    /// 仅用系统输入（`SendInput`）—— 真实鼠标事件，兼容性最好，但会移动指针。
+    /// 仅用系统输入（`SendInput`）—— 真实鼠标事件，兼容性最好。
+    ///
+    /// QQ 小程序（Chromium 内核）只能走这条：实测 JJ 象棋是
+    /// `Chrome_WidgetWin_0` + `WeChatAppEx.exe`（WMPF 小程序运行时），
+    /// 且未开启调试端口，不存在绕过系统输入的可用通道。
+    #[default]
     SendInput,
+    /// 触摸注入（`InjectTouchInput`）—— **不移动鼠标指针**。
+    ///
+    /// 发的是 `WM_POINTER` 触摸消息，与鼠标轨道无关；Chromium 在页面未绑定
+    /// touch 事件时会把它合成为鼠标点击。对 QQ 小程序值得一试，
+    /// 但需目标窗口在前台，且页面若只监听 mouse 事件则可能无效。
+    Touch,
 }
 
 /// 读取当前鼠标位置（屏幕绝对坐标）。用于标定「认输」按钮位置。
@@ -234,9 +445,14 @@ pub fn click_at(_x: i32, _y: i32) -> bool {
 /// 直接给目标窗口发 `WM_LBUTTONDOWN/UP`，坐标是客户区物理坐标
 /// （消息坐标属于客户区，不是屏幕坐标）。
 ///
-/// 优点：不干扰用户正在使用的鼠标，也不必把窗口抢到前台。
-/// 限制：目标程序须用标准 Win32 消息处理点击；若是自绘 + 原始输入
-/// （DirectInput 等）则不会响应 —— 此时需退回 `SendInput`。
+/// 这里用 **`SendMessage`（同步）而非 `PostMessage`（异步）**：
+/// `PostMessage` 只是把消息投进目标线程的消息队列，而游戏/Flash 的渲染循环
+/// 通常不调用 `GetMessage`/`PeekMessage`，消息会一直躺在队列里不被处理。
+/// `SendMessage` 直接调用窗口过程（必要时跨线程封送），只要该窗口自己处理
+/// 鼠标消息就会立即生效 —— 对 Flash ActiveX、Qt 自绘窗口都更可靠。
+///
+/// 限制：目标是 DirectX 自绘 + 原始输入（Raw Input）的程序时不响应，
+/// 此时需退回 `SendInput`。
 #[cfg(target_os = "windows")]
 pub fn post_click(hwnd: u32, client_x: i32, client_y: i32) -> bool {
     if hwnd == 0 {
@@ -247,11 +463,11 @@ pub fn post_click(hwnd: u32, client_x: i32, client_y: i32) -> bool {
     unsafe {
         let h = hwnd as *mut std::ffi::c_void;
         // 先发移动消息：不少程序靠鼠标移动维护 hover/选中态
-        ffi::PostMessageW(h, ffi::WM_MOUSEMOVE, 0, lp as isize);
+        ffi::SendMessageW(h, ffi::WM_MOUSEMOVE, 0, lp as isize);
         sleep(Duration::from_millis(25));
-        ffi::PostMessageW(h, ffi::WM_LBUTTONDOWN, ffi::MK_LBUTTON, lp as isize);
+        ffi::SendMessageW(h, ffi::WM_LBUTTONDOWN, ffi::MK_LBUTTON, lp as isize);
         sleep(Duration::from_millis(40));
-        ffi::PostMessageW(h, ffi::WM_LBUTTONUP, 0, lp as isize);
+        ffi::SendMessageW(h, ffi::WM_LBUTTONUP, 0, lp as isize);
     }
     true
 }
@@ -355,6 +571,19 @@ pub fn play_move(
                 }
                 sleep(Duration::from_millis(220));
                 click_at_restoring(tx, ty)
+            }
+            InputMode::Touch => {
+                let Some((fx, fy)) = map.board_to_screen(camp, from.0, from.1) else {
+                    return false;
+                };
+                let Some((tx, ty)) = map.board_to_screen(camp, to.0, to.1) else {
+                    return false;
+                };
+                if !touch_tap(fx, fy) {
+                    return false;
+                }
+                sleep(Duration::from_millis(220));
+                touch_tap(tx, ty)
             }
         },
         PlayMode::Drag => {

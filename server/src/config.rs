@@ -49,6 +49,35 @@ pub struct AutoConfig {
     pub auto_next_game: bool,
 }
 
+impl AutoConfig {
+    /// 清除无效的标定坐标，返回是否发生了改动。
+    ///
+    /// 旧版本用「鼠标屏幕坐标 − 窗口原点」换算标定点，在非 DPI 感知的进程里
+    /// 两侧坐标系不一致，会算出负数（实测出现 x = -168 这类坐标）。
+    /// 这类坐标必然点不中任何按钮，启动时直接清空让用户重新标定。
+    pub fn sanitize_points(&mut self) -> bool {
+        fn bad(p: &Option<(i32, i32)>) -> bool {
+            matches!(p, Some((x, y)) if *x < 0 || *y < 0)
+        }
+        let mut changed = false;
+        for slot in [
+            &mut self.resign_menu_point,
+            &mut self.resign_confirm_point,
+            &mut self.resign_dialog_point,
+            &mut self.next_game_point,
+        ] {
+            if bad(slot) {
+                *slot = None;
+                changed = true;
+            }
+        }
+        if changed {
+            tracing::warn!("检测到无效的负坐标标定点（旧版本 DPI 换算缺陷），已清除，请重新标定");
+        }
+        changed
+    }
+}
+
 impl Default for AutoConfig {
     fn default() -> Self {
         Self {
@@ -127,6 +156,10 @@ impl Config {
                         config.save();
                     }
                 };
+                // 清理旧版本因 DPI 换算缺陷留下的负坐标标定点
+                if config.auto.sanitize_points() {
+                    config.save();
+                }
                 return config;
             };
 
@@ -314,11 +347,12 @@ pub async fn calibrate_point(target: String) -> Result<(i32, i32), String> {
         .auto_frame
         .lock()
         .map_err(|_| "读取窗口信息失败")?
-        .clone()
         .ok_or("尚未开始监听，请先点「启」后再标定")?;
-    let (ox, oy, scale) = frame;
-    let cx = ((sx - ox) as f32 * scale).round() as i32;
-    let cy = ((sy - oy) as f32 * scale).round() as i32;
+
+    // 交给系统换算屏幕坐标 → 客户区坐标，避免与 DPI 缩放混用坐标系
+    //（自己相减会得到负数，实测标定出 -168 这种不可用坐标）。
+    let (cx, cy) =
+        crate::auto::screen_to_client(frame.hwnd, sx, sy).ok_or("坐标换算失败（窗口句柄无效）")?;
     let mut config = state.config.write().unwrap();
     match target.as_str() {
         "resign_menu" => config.auto.resign_menu_point = Some((cx, cy)),
@@ -356,6 +390,19 @@ pub async fn set_auto_next_game(enabled: bool) {
     config.auto.auto_next_game = enabled;
     config.save();
     debug!("set_auto_next_game: {}", enabled);
+}
+
+/// 请求**立即**执行一次认输（无视额度限制）。
+///
+/// 两个用途：
+/// 1. 验证三个标定点是否点得准 —— 不消耗额度也不用等开局；
+/// 2. 中途启动监听（当前不是开局局面）时手动触发一次。
+#[tauri::command]
+pub async fn request_resign() -> Result<(), String> {
+    let state = SHARED_STATE.get().ok_or("程序尚未初始化")?;
+    *state.resign_request.lock().map_err(|_| "状态锁失败")? = true;
+    debug!("已请求立即认输");
+    Ok(())
 }
 
 /// 读取当前鼠标的屏幕绝对坐标（标定流程用）。

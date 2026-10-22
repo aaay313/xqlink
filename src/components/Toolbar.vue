@@ -520,8 +520,8 @@ async function getEngineConfig() {
 interface AutoConfig {
     auto_play: boolean;
     play_mode: "click" | "drag";
-    /** 输入通道：auto / message / sendinput */
-    input_mode: "auto" | "message" | "sendinput";
+    /** 输入通道：auto / message / sendinput / touch */
+    input_mode: "auto" | "message" | "sendinput" | "touch";
     /** 最多自动认输多少把（0 = 不认输） */
     auto_resign_limit: number;
     /** 已自动认输的把数 */
@@ -541,7 +541,7 @@ interface AutoConfig {
 const autoConfig = ref<AutoConfig>({
     auto_play: false,
     play_mode: "click",
-    input_mode: "auto",
+    input_mode: "sendinput",
     auto_resign_limit: 0,
     resign_count: 0,
     resign_menu_point: null,
@@ -559,9 +559,10 @@ const playModeOptions = [
 ];
 
 const inputModeOptions = [
-    { label: "自动（不动鼠标，无效则降级）", value: "auto" },
-    { label: "仅窗口消息（完全不移动鼠标）", value: "message" },
-    { label: "仅系统输入（兼容性最好）", value: "sendinput" },
+    { label: "系统输入（兼容性最好，推荐）", value: "sendinput" },
+    { label: "触摸注入（不移动鼠标指针，需实测）", value: "touch" },
+    { label: "自动（先试窗口消息，无效再降级）", value: "auto" },
+    { label: "仅窗口消息（对 QQ 小程序无效）", value: "message" },
 ];
 
 async function getAutoConfig() {
@@ -582,6 +583,20 @@ async function setAutoInputMode() {
 
 async function setAutoNextGame() {
     await invoke("set_auto_next_game", { enabled: autoConfig.value.auto_next_game });
+}
+
+/** 立即认输一次：验证标定点是否点得准，或中途启动时手动触发。 */
+async function requestResign() {
+    try {
+        await invoke("request_resign");
+        dialog.success({
+            title: "已发送",
+            content: "程序将在下一轮执行认输（不消耗额度，用于验证标定点）。",
+            positiveText: "好",
+        });
+    } catch (e) {
+        dialog.error({ title: "发送失败", content: String(e), positiveText: "好" });
+    }
 }
 
 const calibrateTargets = {
@@ -915,6 +930,11 @@ async function toggleEngine() {
                             v-model:value="autoConfig.auto_next_game"
                             @update:value="setAutoNextGame"
                         />
+                    </n-form-item>
+                    <n-form-item label="验证标定" feedback="立刻按标定顺序点一遍，检验三处位置是否准确">
+                        <n-button size="tiny" type="warning" @click="requestResign"
+                            >立即认输一次</n-button
+                        >
                     </n-form-item>
                 </n-form>
             </n-drawer-content>

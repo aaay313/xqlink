@@ -32,10 +32,12 @@ struct SharedState {
     /// None=跟随自动判断；Some(true)=轮到我方；Some(false)=等对方。
     /// 监听线程每轮读取并清空，手动值优先于自动判断，生效一次。
     turn_override: Mutex<Option<bool>>,
-    /// 目标窗口的几何信息：(客户区屏幕原点 x, y, DPI 缩放比)。
-    /// 由监听线程持续刷新 —— 标定「认输」按钮位置时要把屏幕坐标换算成
-    /// 客户区图像坐标，窗口移动/缩放后仍需准确，故不能只记一次。
-    auto_frame: Mutex<Option<(i32, i32, f32)>>,
+    /// 目标窗口的几何信息。由监听线程持续刷新 —— 标定「认输」按钮位置时要把
+    /// 屏幕坐标换算成客户区坐标，窗口移动/缩放后仍需准确，故不能只记一次。
+    auto_frame: Mutex<Option<auto::AutoFrame>>,
+    /// 界面点了「立即认输」——监听线程下一轮执行一次认输后清空。
+    /// 用途：① 验证标定是否正确；② 中途启动监听（不是开局局面）时手动触发。
+    resign_request: Mutex<bool>,
 }
 
 static SHARED_STATE: OnceLock<SharedState> = OnceLock::new();
@@ -64,6 +66,7 @@ pub fn run() {
                     history: Mutex::new(Vec::new()),
                     turn_override: Mutex::new(None),
                     auto_frame: Mutex::new(None),
+                    resign_request: Mutex::new(false),
                 }
             });
 
@@ -97,6 +100,7 @@ pub fn run() {
             config::calibrate_point,
             config::clear_auto_points,
             config::set_auto_next_game,
+            config::request_resign,
             config::capture_cursor_pos,
         ])
         .run(tauri::generate_context!())

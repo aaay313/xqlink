@@ -271,15 +271,17 @@ impl AnalysisContext {
         })
     }
 
-    /// 刷新共享状态里的窗口几何 —— 标定「认输」按钮位置时要把屏幕坐标
-    /// 换算成客户区坐标，窗口被移动/缩放后必须跟着更新。
+    /// 刷新共享状态里的窗口几何 —— 标定「认输」按钮位置时要做坐标换算，
+    /// 窗口被移动/缩放后必须跟着更新。
     fn refresh_auto_frame(&self) {
-        let origin = self.window.client_origin();
-        let scale = self.window.scale_factor();
         if let Some(state) = SHARED_STATE.get()
             && let Ok(mut frame) = state.auto_frame.lock()
         {
-            *frame = Some((origin.0, origin.1, scale));
+            *frame = Some(auto::AutoFrame {
+                origin: self.window.client_origin(),
+                scale: self.window.scale_factor(),
+                hwnd: self.window.hwnd(),
+            });
         }
     }
 
@@ -323,11 +325,13 @@ impl AnalysisContext {
                 }
                 let tries = att.tries + 1;
                 let mut eff = att.input;
-                if eff != auto::InputMode::SendInput && tries >= DOWNGRADE_AFTER {
-                    warn!(
-                        "自动走棋 {:?} 连续 {} 次未生效，改用系统输入",
-                        eff, tries
-                    );
+                // 只有窗口消息类通道才降级；触摸注入是独立通道，不该被顶掉
+                if matches!(
+                    eff,
+                    auto::InputMode::Auto | auto::InputMode::Message
+                ) && tries >= DOWNGRADE_AFTER
+                {
+                    warn!("自动走棋 {:?} 连续 {} 次未生效，改用系统输入", eff, tries);
                     eff = auto::InputMode::SendInput;
                     self.message_input_broken = true;
                 }
@@ -335,8 +339,10 @@ impl AnalysisContext {
             }
             _ => (0, configured_input),
         };
-        // 已确认窗口消息无效 → 一律用系统输入
-        if self.message_input_broken && effective != auto::InputMode::SendInput {
+        // 已确认窗口消息无效 → 一律用系统输入（触摸是独立通道，不受影响）
+        if self.message_input_broken
+            && matches!(effective, auto::InputMode::Auto | auto::InputMode::Message)
+        {
             effective = auto::InputMode::SendInput;
         }
 
@@ -396,7 +402,19 @@ impl AnalysisContext {
     fn should_resign_now(&self) -> bool {
         let config = SHARED_STATE.get().unwrap().config.read().unwrap();
         let limit = config.auto.auto_resign_limit;
-        limit > 0 && config.auto.resign_count < limit
+        let count = config.auto.resign_count;
+        if limit == 0 {
+            debug!("自动认输未启用（认输额度为 0）");
+            return false;
+        }
+        if count >= limit {
+            debug!("自动认输额度已用满（{}/{}），不再认输", count, limit);
+            return false;
+        }
+        if config.auto.resign_menu_point.is_none() {
+            debug!("自动认输缺少「认输①入口」标定点");
+        }
+        true
     }
 
     /// 执行自动认输。
@@ -429,13 +447,12 @@ impl AnalysisContext {
             )
         };
         let Some(map) = self.screen_map() else { return; };
+        let hwnd = self.window.hwnd();
 
-        // 标定存的是客户区图像坐标 → 屏幕绝对坐标
-        let to_screen = |p: (i32, i32)| -> (i32, i32) {
-            (
-                (map.origin.0 as f32 + p.0 as f32 / map.scale).round() as i32,
-                (map.origin.1 as f32 + p.1 as f32 / map.scale).round() as i32,
-            )
+        // 标定存的是客户区坐标 → 交给系统换算成屏幕坐标。
+        // 与 ScreenToClient 严格互逆，不受 DPI 感知状态影响。
+        let to_screen = |p: (i32, i32)| -> Option<(i32, i32)> {
+            auto::client_to_screen(hwnd, p.0, p.1)
         };
 
         // 第一步：展开底部工具菜单
@@ -443,7 +460,10 @@ impl AnalysisContext {
             warn!("尚未标定认输第一步（底部「投降」入口），跳过自动认输");
             return;
         };
-        let (mx, my) = to_screen(menu);
+        let Some((mx, my)) = to_screen(menu) else {
+            warn!("认输第一步坐标换算失败（窗口句柄无效）");
+            return;
+        };
         auto::focus_window(self.window.hwnd());
         if !auto::click_at(mx, my) {
             warn!("认输第一步（展开菜单）点击失败");
@@ -456,7 +476,10 @@ impl AnalysisContext {
             warn!("尚未标定认输第二步（菜单里的「退出/投降」），跳过自动认输");
             return;
         };
-        let (cx, cy) = to_screen(confirm);
+        let Some((cx, cy)) = to_screen(confirm) else {
+            warn!("认输第二步坐标换算失败");
+            return;
+        };
         if !auto::click_at(cx, cy) {
             warn!("认输第二步（菜单项）点击失败");
             return;
@@ -465,9 +488,10 @@ impl AnalysisContext {
         // 第三步：确认弹窗点「退出」（弹窗文案："退出将判负，确定要退出吗？"）
         if let Some(dialog) = dialog_pt {
             thread::sleep(DIALOG_WAIT);
-            let (dx, dy) = to_screen(dialog);
-            if !auto::click_at(dx, dy) {
-                warn!("认输第三步（确认弹窗「退出」）点击失败");
+            if let Some((dx, dy)) = to_screen(dialog) {
+                if !auto::click_at(dx, dy) {
+                    warn!("认输第三步（确认弹窗「退出」）点击失败");
+                }
             }
         } else {
             warn!("尚未标定认输第三步（确认弹窗的「退出」），可能会停在确认框上");
@@ -486,12 +510,13 @@ impl AnalysisContext {
             match next_pt {
                 Some(p) => {
                     thread::sleep(SETTLE_WAIT);
-                    let (x, y) = to_screen(p);
-                    auto::focus_window(self.window.hwnd());
-                    if auto::click_at(x, y) {
-                        info!("已自动开始下一局");
-                    } else {
-                        warn!("「开始下一局」点击失败");
+                    if let Some((x, y)) = to_screen(p) {
+                        auto::focus_window(self.window.hwnd());
+                        if auto::click_at(x, y) {
+                            info!("已自动开始下一局");
+                        } else {
+                            warn!("「开始下一局」点击失败");
+                        }
                     }
                 }
                 None => warn!("已开启自动开下一局，但尚未标定「开始下一局」按钮"),
@@ -1016,6 +1041,23 @@ fn process_analysis_loop(mut context: AnalysisContext) {
             current_state = next_state;
             last_elapsed = started.elapsed();
             continue;
+        }
+
+        // 界面请求的「立即认输」：用于验证标定点，或中途启动监听时手动触发。
+        // 必须在抓图之前处理 —— do_resign 会依次点击并有等待，不该夹在识别中间。
+        let resign_requested = SHARED_STATE
+            .get()
+            .map(|s| {
+                let mut flag = s.resign_request.lock().unwrap();
+                let v = *flag;
+                *flag = false;
+                v
+            })
+            .unwrap_or(false);
+        if resign_requested {
+            info!("收到「立即认输」请求");
+            context.do_resign();
+            context.resigned_this_game = true;
         }
 
         // 捕获并分析棋盘
