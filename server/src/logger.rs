@@ -39,7 +39,7 @@ pub fn init_tracer(level: Level, home_dir: &std::path::Path) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         // 默认过滤级别设置
         let filter_str = format!(
-            "{},yimou={},yimou_lib={},ort=warn,tower_http=warn,hyper=warn,hyper_util=warn,xcap=warn",
+            "{},xqlink={},xqlink_lib={},ort=warn,tower_http=warn,hyper=warn,hyper_util=warn,xcap=warn",
             level.as_str(),
             level.as_str(),
             level.as_str()

@@ -1,6 +1,6 @@
 {
     "$schema": "https://schema.tauri.app/config/2",
-    "productName": "Yimou",
+    "productName": "xqlink",
     "version": "0.1.2",
     "identifier": "top.itmeng.xqlink",
     "build": {
@@ -13,7 +13,7 @@
     "app": {
         "windows": [
             {
-                "title": "弈谋",
+                "title": "中国象棋",
                 "width": 660,
                 "height": 580,
                 "minWidth": 380,

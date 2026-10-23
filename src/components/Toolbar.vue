@@ -611,11 +611,17 @@ const calibrateTargets = {
 const autoNote = ref("");
 const autoNoteOk = ref(false);
 let autoNoteTimer: number | undefined;
+let visionDialogShown = false;
 
 listen<string>("auto_note", (e) => {
     const msg = String(e.payload ?? "");
     autoNote.value = msg;
     autoNoteOk.value = msg.includes("已自动认输");
+    // 识别失败这类阻断性问题，抽屉没开也要让用户看到（本会话只弹一次）
+    if (msg.startsWith("识别不到棋盘") && !visionDialogShown) {
+        visionDialogShown = true;
+        dialog.warning({ title: "识别不到棋盘", content: msg, positiveText: "好" });
+    }
     window.clearTimeout(autoNoteTimer);
     autoNoteTimer = window.setTimeout(() => (autoNote.value = ""), 15000);
 });
@@ -704,7 +710,7 @@ async function toggleEngine() {
         <n-space vertical size="small">
             <n-flex align="center" justify="space-between">
                 <n-space align="center" :size="8">
-                    <span class="app-title">弈谋</span>
+                    <span class="app-title">中国象棋</span>
                     <n-select
                         size="small"
                         v-model:value="mode"
@@ -920,7 +926,7 @@ async function toggleEngine() {
                             <n-button size="tiny" tertiary @click="resetResignCount">重置</n-button>
                         </n-space>
                     </n-form-item>
-                    <n-form-item v-if="autoNote" label="认输状态">
+                    <n-form-item v-if="autoNote" label="状态提示">
                         <n-alert size="small" :type="autoNoteOk ? 'success' : 'warning'" :bordered="false">
                             {{ autoNote }}
                         </n-alert>

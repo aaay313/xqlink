@@ -95,6 +95,8 @@ struct AnalysisContext {
     resigned_this_game: bool,
     /// 上一次尝试自动认输的时间。失败后限流重试，避免每帧狂点。
     last_resign_try: Option<std::time::Instant>,
+    /// 上一次推送识别失败提示的时间（限流，避免每帧 emit）。
+    last_vision_note: Option<std::time::Instant>,
     /// 窗口消息方式对本程序无效（自绘 + 原始输入）→ 永久改用系统输入。
     message_input_broken: bool,
 }
@@ -135,6 +137,7 @@ impl AnalysisContext {
             auto_attempt: None,
             resigned_this_game: false,
             last_resign_try: None,
+            last_vision_note: None,
             message_input_broken: false,
         }
     }
@@ -186,6 +189,23 @@ impl AnalysisContext {
 
         let hash = image_hash(&image);
         let result = get_board(image);
+
+        // 识别失败的原因必须让用户看得见（只写日志等于没写）：
+        // 模板库为空且中途启动监听时，界面上是"一直读不出盘"，
+        // 用户无从知道要回标准开局采集模板。限流 15 秒一条。
+        if result.is_none()
+            && self
+                .last_vision_note
+                .map(|t| t.elapsed() > Duration::from_secs(15))
+                .unwrap_or(true)
+            && vision::bank().lock().map(|b| b.is_empty()).unwrap_or(false)
+        {
+            self.last_vision_note = Some(std::time::Instant::now());
+            let _ = self.app.emit(
+                "auto_note",
+                "识别不到棋盘：模板库为空，且当前不是标准开局。请在 JJ 象棋新开一局再点「开始分析」，模板采集后会永久保存，之后中途启动也能识别".to_string(),
+            );
+        }
 
         // 刷新窗口几何：自动点击换算屏幕坐标、标定认输按钮都要用，
         // 窗口被移动/缩放后必须跟着更新。
