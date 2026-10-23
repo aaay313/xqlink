@@ -1,4 +1,6 @@
-use std::collections::VecDeque;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::thread;
 use std::time::Duration;
 
@@ -16,13 +18,16 @@ use xcap::image::Rgba;
 use crate::auto;
 use crate::chess;
 use crate::clock;
+use crate::common;
 use crate::engine::EngineConfig;
 use crate::engine::QueryResult;
 use crate::engine::QueryState;
 use crate::knife;
 use crate::listen::ListenWindow;
 use crate::listen::Window;
-use crate::vision;
+use crate::yolo::predict;
+use crate::yolo::IMAGE_HEIGHT;
+use crate::yolo::IMAGE_WIDTH;
 use crate::SHARED_STATE;
 
 /// 二次确认棋盘前等待的毫秒数。
@@ -95,8 +100,10 @@ struct AnalysisContext {
     resigned_this_game: bool,
     /// 上一次尝试自动认输的时间。失败后限流重试，避免每帧狂点。
     last_resign_try: Option<std::time::Instant>,
-    /// 上一次推送识别失败提示的时间（限流，避免每帧 emit）。
-    last_vision_note: Option<std::time::Instant>,
+    /// 「我方走后」盘面的出现次数（长将防护用，哈希 -> 次数）
+    seen_boards: HashMap<u64, u32>,
+    /// 「轮到我方」盘面的出现次数。>0 说明这个局面已经循环过至少一圈
+    turn_boards: HashMap<u64, u32>,
     /// 窗口消息方式对本程序无效（自绘 + 原始输入）→ 永久改用系统输入。
     message_input_broken: bool,
 }
@@ -137,7 +144,8 @@ impl AnalysisContext {
             auto_attempt: None,
             resigned_this_game: false,
             last_resign_try: None,
-            last_vision_note: None,
+            seen_boards: HashMap::new(),
+            turn_boards: HashMap::new(),
             message_input_broken: false,
         }
     }
@@ -190,23 +198,6 @@ impl AnalysisContext {
         let hash = image_hash(&image);
         let result = get_board(image);
 
-        // 识别失败的原因必须让用户看得见（只写日志等于没写）：
-        // 模板库为空且中途启动监听时，界面上是"一直读不出盘"，
-        // 用户无从知道要回标准开局采集模板。限流 15 秒一条。
-        if result.is_none()
-            && self
-                .last_vision_note
-                .map(|t| t.elapsed() > Duration::from_secs(15))
-                .unwrap_or(true)
-            && vision::bank().lock().map(|b| b.is_empty()).unwrap_or(false)
-        {
-            self.last_vision_note = Some(std::time::Instant::now());
-            let _ = self.app.emit(
-                "auto_note",
-                "识别不到棋盘：模板库为空，且当前不是标准开局。请在 JJ 象棋新开一局再点「开始分析」，模板采集后会永久保存，之后中途启动也能识别".to_string(),
-            );
-        }
-
         // 刷新窗口几何：自动点击换算屏幕坐标、标定认输按钮都要用，
         // 窗口被移动/缩放后必须跟着更新。
         self.refresh_auto_frame();
@@ -256,7 +247,7 @@ impl AnalysisContext {
         let config = SHARED_STATE.get().unwrap().config.read().unwrap();
 
         // 飞刀开局优先：命中则直接用飞刀着法，否则交给引擎
-        let result = match self.match_knife(camp, board, &config.engine) {
+        let mut result = match self.match_knife(camp, board, &config.engine) {
             Some(knife_result) => Some(knife_result),
             None => {
                 let state = SHARED_STATE.get().unwrap();
@@ -271,8 +262,34 @@ impl AnalysisContext {
             self.last_score = engine_result.score;
         }
 
+        // -- 长将防护 ----------------------------------------------------
+        // JJ 对长将（反复同一局面将军）会判负。当「轮到我方」的局面已经
+        // 出现过（说明在循环，将不死对方），把会导致「已出现过盘面」的
+        // 候选着法排到后面（稳定排序，未走过的着法保持引擎原优先级），
+        // 优先打破循环 —— 覆盖"同一位置连续将不超过 5 步"的规则。
+        let h0 = board_key(&board);
+        let repeated = self.turn_boards.get(&h0).copied().unwrap_or(0) > 0;
+        if repeated
+            && let Some(r) = result.as_mut()
+            && r.pvs.len() > 1
+        {
+            r.pvs.sort_by_key(|pv| {
+                let eb = chess::board_move(board, pv);
+                self.seen_boards.get(&board_key(&eb)).copied().unwrap_or(0)
+            });
+            info!("检测到重复局面（长将风险），已优先选择未走过的候选着法");
+        }
+
         let (expect_move, expect_board) =
             analyse(&self.app, result.unwrap(), board, self.our_turn)?;
+
+        // 登记走后的盘面与本局面的出现次数；防抖表过大时清空重建
+        *self.seen_boards.entry(board_key(&expect_board)).or_insert(0) += 1;
+        *self.turn_boards.entry(h0).or_insert(0) += 1;
+        if self.seen_boards.len() > 1024 {
+            self.seen_boards.clear();
+            self.turn_boards.clear();
+        }
 
         // 自动走棋：把引擎建议的着法直接点在棋盘上（若已开启）
         self.try_auto_move(camp, board, &expect_move);
@@ -447,7 +464,7 @@ impl AnalysisContext {
     /// 对局结束、结算界面出现后，若开启了「自动开始下一局」再点一次。
     ///
     /// 返回 true 表示三步点击都已发出（投降大概率成功）；失败返回 false，
-    /// 并通过 `auto_note` 事件把原因推到界面 —— 文件日志在本程序里不可靠，
+    /// 并通过 `auto_note` 事件把原因推到界面 —— 文件日志不可靠，
     /// 界面必须能看到失败原因，否则用户无从排查。
     fn do_resign(&mut self) -> bool {
         /// 结算动画与「开始下一局」按钮出现的等待时间。
@@ -470,7 +487,7 @@ impl AnalysisContext {
                 config.auto.auto_next_game,
             )
         };
-        let Some(_map) = self.screen_map() else { return false; };
+        let Some(map) = self.screen_map() else { return false; };
         let hwnd = self.window.hwnd();
 
         // 失败原因必须让用户看得见：文件日志会丢，事件不会。
@@ -985,69 +1002,44 @@ fn parse_iccs_pos(pos: &str) -> Option<(usize, usize)> {
 /// 识别一帧图像，返回 (阵营, 棋盘, 每格类别置信度)。
 ///
 /// 类别置信度供调用方做「易混类别低置信度兜底」（见 stabilize_confusable）。
-///
-/// 识别走 `vision`（确定性几何 + NCC 模板匹配），不再依赖 ONNX 模型。
-/// 模板库在**开局帧**自动采集 32 枚：标准局面已知，因此无需人工标注。
-/// 若模板库为空且当前不是开局（中途启动监听），本帧直接跳过 ——
-/// 猜一套标签去匹配只会污染模板库。
 pub fn get_board(
     image: ImageBuffer<Rgba<u8>, Vec<u8>>,
 ) -> Option<(chess::Camp, [[char; 9]; 10], [[f32; 9]; 10])> {
-    let rgb = vision::to_rgb(&image);
-    let Some(grid) = grid_for(&rgb) else {
-        trace!("未定位到棋盘（可能不在对局界面）");
-        return None;
-    };
-    let mut bank = match vision::bank().lock() {
-        Ok(b) => b,
-        Err(e) => {
-            warn!("模板库锁获取失败: {e}");
+    // 推理失败（模型与运行时不匹配、内存不足等）不该让整个程序崩掉 ——
+    // 丢掉这一帧、下一轮重试即可。原实现用的是 unwrap。
+    let mut data = match predict(image.clone()) {
+        Ok(data) => data,
+        Err(err) => {
+            warn!("识别推理失败，跳过本帧: {err}");
             return None;
         }
     };
 
-    if bank.is_empty() {
-        if !vision::looks_like_start(&rgb, &grid) {
-            warn!("模板库为空且当前不是开局，请在本局结束后重新开局以采集模板");
-            return None;
+    // 原图未检出棋盘时，用反相图补一个棋盘框（深色皮肤适配，见 invert_image）。
+    // 棋子仍取原图检测结果：反相后棋子样式（蓝底白字）同样偏离训练分布，
+    // 实测同一局面原图重建 22 子、反相仅 12 子 —— 故反相只借棋盘框，不借棋子。
+    if !data.iter().any(|d| d.label == '0') {
+        if let Ok(inverted) = predict(common::invert_image(&image)) {
+            if let Some(board_det) = inverted.into_iter().find(|d| d.label == '0') {
+                trace!("原图未检出棋盘，借反相图的棋盘框（深色皮肤）");
+                data.push(board_det);
+            }
         }
-        let n = bank.seed_start(&rgb, &grid, &vision::START_BOARD);
-        info!("已从开局帧采集 {n} 枚棋子模板（格距 {:.1}x{:.1}）", grid.cw, grid.ch);
-        vision::persist(&bank);
     }
 
-    // 模板库非空但读不出子 —— 多半是换了皮肤，旧模板整体失配。
-    // 若此刻正好是开局，就地重建模板库，避免用户卡在「一直读不出盘」。
-    let mut read = vision::read_with_grid(&rgb, &grid, &bank);
-    let count = read
-        .as_ref()
-        .map(|(_, b, _)| b.iter().flatten().filter(|c| **c != ' ').count())
-        .unwrap_or(0);
-    if count < 6 && vision::looks_like_start(&rgb, &grid) {
-        bank.clear();
-        let n = bank.seed_start(&rgb, &grid, &vision::START_BOARD);
-        info!("旧模板与新画面失配，已按开局重建 {n} 枚模板");
-        vision::persist(&bank);
-        read = vision::read_with_grid(&rgb, &grid, &bank);
+    if let Ok((camp, mut board, conf)) = common::detections_to_board(&data) {
+        chess::board_fix(&camp, &mut board);
+        Some((camp, board, conf))
+    } else {
+        None
     }
-
-    let (_, mut board, conf) = read?;
-    let camp = vision::camp_of(&board)?;
-    chess::board_fix(&camp, &mut board);
-    Some((camp, board, conf))
 }
 
-/// 取格点：优先用开监听时缓存的值，没有才现场检测（并缓存）。
-///
-/// 缓存很关键：`detect_board_bbox` 里的形态学闭运算在大窗口上要几十毫秒，
-/// 每帧都做会拖慢整个分析循环。
-fn grid_for(rgb: &xcap::image::RgbImage) -> Option<vision::Grid> {
-    if let Some(g) = vision::cached_grid() {
-        return Some(g);
-    }
-    let g = vision::detect_grid(rgb)?;
-    vision::set_grid(Some(g));
-    Some(g)
+/// 盘面哈希：长将防护用（同一盘面出现次数统计）。
+fn board_key(board: &[[char; 9]; 10]) -> u64 {
+    let mut h = DefaultHasher::new();
+    board.hash(&mut h);
+    h.finish()
 }
 
 pub fn analyse(
@@ -1359,6 +1351,8 @@ fn process_analysis_loop(mut context: AnalysisContext) {
 
                         // 新的一局开始：重置"本把是否已认输"
                         context.resigned_this_game = false;
+                        context.seen_boards.clear();
+                        context.turn_boards.clear();
                         // 我方执红 = 我方先手，棋局刚开局就能认输，直接认输
                         if context.should_resign_now() {
                             context.try_resign();
@@ -1381,6 +1375,8 @@ fn process_analysis_loop(mut context: AnalysisContext) {
                     // 认输要等对方走出第一步（此时认输按钮才可用），见 StartPos→Move 分支
                     if context.last_board != board {
                         context.resigned_this_game = false;
+                        context.seen_boards.clear();
+                        context.turn_boards.clear();
                     }
                     context.last_board = board;
                     context.update_ui(&camp, board);
@@ -1532,35 +1528,35 @@ pub async fn start_listen(app: AppHandle, target: Window) -> Result<(), String> 
     }
 
     // 初始化监听窗口模块
-    let mut window = ListenWindow::new(&target, 0, 0).ok_or("找不到目标窗口，可能已经被关闭")?;
+    let mut window = ListenWindow::new(&target, IMAGE_WIDTH, IMAGE_HEIGHT)
+        .ok_or("找不到目标窗口，可能已经被关闭")?;
     let image = window.capture().ok_or("抓取窗口图像失败")?;
-    let rgb = vision::to_rgb(&image);
 
-    // 定位棋盘并设置裁剪区。
-    //
-    // 裁剪区必须让 `auto::ScreenMap::board_to_client` 的换算成立：
-    // 那里用的是 px = w*(col+1)/10、py = h*(row+1)/11，即「裁剪区 = 棋盘 ± 半格」，
-    // 反解出来就是 crop = (x0-cw, y0-ch, 10cw, 11ch)。
-    let grid = match vision::detect_grid(&rgb) {
-        Some(g) => g,
-        None => return Err("未识别到棋盘，请确认已进入对局界面".to_string()),
-    };
-    let (cw, ch) = (grid.cw, grid.ch);
-    let cx = grid.x0 - cw;
-    let cy = grid.y0 - ch;
-    let cwidth = 10.0 * cw;
-    let cheight = 11.0 * ch;
+    let image_h = image.height();
+    let image_w = image.width();
 
-    if cx < 0.0 || cy < 0.0 || cx + cwidth > image.width() as f32 || cy + cheight > image.height() as f32
-    {
-        // 棋盘贴边时无法保证换算基准，宁可拒绝也不要算错坐标 ——
-        // 坐标算错会让自动走棋点到相邻格，比不点更糟。
-        return Err("棋盘超出窗口边界，请把窗口放大一些".to_string());
+    let mut detections = predict(image.clone()).map_err(|e| format!("识别失败: {e}"))?;
+
+    // 原图未检出棋盘时尝试反相：深色皮肤棋盘（暗底亮线）不在模型训练分布内，
+    // 反相后变回"亮底暗线"即可检出（实测置信度 0→0.95）。
+    // 没有这一步时，深色皮肤会让「启」直接失败在"未识别到棋盘"。
+    if !detections.iter().any(|d| d.label == '0') {
+        if let Ok(inverted) = predict(common::invert_image(&image)) {
+            if inverted.iter().any(|d| d.label == '0') {
+                info!("原图未检出棋盘，反相后检出（深色棋盘皮肤）");
+                detections = inverted;
+            }
+        }
     }
-    window.set_sub_bound(cx as u32, cy as u32, cwidth as u32, cheight as u32);
-    // 裁剪区内的格点固定为 (cw, ch) 起点、同格距 —— 换算成裁剪区坐标系后缓存。
-    vision::set_grid(Some(vision::Grid { x0: cw, y0: ch, cw, ch }));
-    info!("棋盘已锁定：格距 {:.1}x{:.1}，裁剪区 ({:.0},{:.0}) {:.0}x{:.0}", cw, ch, cx, cy, cwidth, cheight);
+
+    match common::detections_bound(image_w, image_h, &detections) {
+        Ok((x, y, w, h)) => {
+            window.set_sub_bound(x, y, w, h); // 设置窗口边界
+        }
+        Err(e) => {
+            return Err(e); // 未识别到棋盘
+        }
+    }
 
     // 新一轮监听 = 新的一局，清空上一局的棋谱
     if let Some(state) = SHARED_STATE.get()
@@ -1595,8 +1591,6 @@ pub fn stop_listen() {
             listen_thread.join().unwrap();
         }
     debug!("stoped");
-    // 裁剪区失效，格点缓存一并清空；下次「启」会重新定位
-    vision::set_grid(None);
 }
 
 #[cfg(test)]

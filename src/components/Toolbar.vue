@@ -611,17 +611,11 @@ const calibrateTargets = {
 const autoNote = ref("");
 const autoNoteOk = ref(false);
 let autoNoteTimer: number | undefined;
-let visionDialogShown = false;
 
 listen<string>("auto_note", (e) => {
     const msg = String(e.payload ?? "");
     autoNote.value = msg;
     autoNoteOk.value = msg.includes("已自动认输");
-    // 识别失败这类阻断性问题，抽屉没开也要让用户看到（本会话只弹一次）
-    if (msg.startsWith("识别不到棋盘") && !visionDialogShown) {
-        visionDialogShown = true;
-        dialog.warning({ title: "识别不到棋盘", content: msg, positiveText: "好" });
-    }
     window.clearTimeout(autoNoteTimer);
     autoNoteTimer = window.setTimeout(() => (autoNote.value = ""), 15000);
 });

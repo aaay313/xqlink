@@ -53,10 +53,9 @@ pub fn init_tracer(level: Level, home_dir: &std::path::Path) {
         fs::create_dir_all(&log_dir).expect("无法创建日志目录");
     }
 
-    // 设置每日滚动日志文件。
-    // 直接同步写：之前用 non_blocking 缓冲 + WorkerGuard，本程序是窗口进程，
-    // 退出时 guard 不可靠，实测日志整段丢失（文件 0 字节），事后无法排查。
-    // INFO 级别每 0.6s 至多几条，同步写的磁盘开销可以接受。
+    // 设置每日滚动日志文件
+    // 直接同步写：non_blocking 缓冲在窗口进程退出时不可靠，实测日志 0 字节。
+    // INFO 级别日志量低，同步写的磁盘开销可以接受。
     let file_appender = rolling::daily(log_dir, "runtime.log");
 
     // 创建控制台输出层

@@ -52,8 +52,14 @@ tokio = { version = "1.44", default-features = false, features = [
 # 显式开启 std 后 build.rs 直接走 CARGO_FEATURE_STD 分支，不再探测。
 indexmap = { version = "1.9", features = ["std"] }
 
-# 识别层已换为 vision.rs（确定性算法），不再需要 ONNX Runtime。
-# 保留 ort 依赖会继续要求 onnxruntime.dll 随包分发，因此整段移除。
+[target.'cfg(target_os = "windows")'.dependencies]
+ort = { version = "=2.0.0-rc.9", default-features = false, features = ["ndarray", "load-dynamic"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ort = { version = "=2.0.0-rc.9", features = ["coreml"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ort = { version = "=2.0.0-rc.9", features = ["cuda", "load-dynamic"] }
 
 [profile.dev]
 incremental = true
@@ -61,8 +67,11 @@ incremental = true
 [features]
 default = []
 rotate = []
-# GPU 加速随 ONNX 一并移除；保留空 feature 以免既有构建脚本报错。
-gpu = []
+gpu = [
+    "ort/copy-dylibs",
+    "ort/cuda",
+    "ort/directml"
+]
 
 [profile.release]
 codegen-units = 1

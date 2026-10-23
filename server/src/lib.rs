@@ -10,19 +10,14 @@ use tauri::Manager as _;
 mod auto;
 mod chess;
 mod clock;
+mod common;
 mod config;
 mod engine;
 mod knife;
 mod listen;
 mod logger;
-mod vision;
 mod worker;
-
-// 原 YOLO 识别链（yolo.rs / common.rs）已被 vision.rs 取代，连同 ort 依赖一并停用。
-// 文件仍保留在磁盘上，便于对照与回退；不参与编译，因此 ONNX 模型也不会被
-// include_bytes! 打进二进制。
-// mod common;
-// mod yolo;
+mod yolo;
 
 // 全局共享状态，用Arc和Mutex包装以实现线程安全共享
 struct SharedState {
@@ -55,10 +50,6 @@ pub fn run() {
             // 原实现固定用 DEBUG，忽略了 config.loglevel，导致识别主循环高频写盘。
             let config = config::Config::load(&app.path().config_dir().unwrap());
             logger::init_tracer(logger::parse_level(&config.loglevel), &app.path().app_data_dir().unwrap());
-
-            // 棋子模板库：与皮肤绑定，按配置目录持久化。
-            // 首次在开局帧自动采集，之后跨会话复用，中途启动监听也能读盘。
-            vision::init(app.path().config_dir().unwrap().join("vision_templates.json"));
 
             let _ = SHARED_STATE.get_or_init(|| {
                 let lib_path = app.path().resolve("../libs/pikafish", tauri::path::BaseDirectory::Resource).unwrap();
