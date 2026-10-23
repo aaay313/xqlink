@@ -7,6 +7,7 @@ import { listening } from "../session";
 import { replayFen } from "../replay";
 import { useDialog } from "naive-ui";
 import {
+    NAlert,
     NButton,
     NCard,
     NFlex,
@@ -606,33 +607,81 @@ const calibrateTargets = {
     next_game: "对局结束、结算界面上的「开始下一局」按钮",
 } as const;
 
-/** 标定某个按钮位置：让用户把鼠标移过去再确定。 */
+/** 自动认输的执行结果（后端经 auto_note 事件推送）。 */
+const autoNote = ref("");
+const autoNoteOk = ref(false);
+let autoNoteTimer: number | undefined;
+
+listen<string>("auto_note", (e) => {
+    const msg = String(e.payload ?? "");
+    autoNote.value = msg;
+    autoNoteOk.value = msg.includes("已自动认输");
+    window.clearTimeout(autoNoteTimer);
+    autoNoteTimer = window.setTimeout(() => (autoNote.value = ""), 15000);
+});
+
+/** 标定中的目标与倒计时（驱动对话框内容）。 */
+const calib = ref<{ tip: string; left: number } | null>(null);
+let calibTimer: number | undefined;
+
+/**
+ * 标定某个按钮位置：5 秒倒计时后自动记录鼠标位置。
+ *
+ * 为什么不用"移过去后点确定"：点「确定」这个动作本身会把鼠标从
+ * 目标按钮上挪开，抓到的是确定按钮的坐标 —— 尤其认输②③的目标
+ * 只在 JJ 菜单/弹窗打开时存在，根本没法既悬停又点确定。
+ * 倒计时抓取没有这个问题：悬停期间不发生任何点击。
+ */
 function calibratePoint(
     target: "resign_menu" | "resign_confirm" | "resign_dialog" | "next_game",
 ) {
-    dialog.warning({
+    if (calibTimer !== undefined) return; // 已有标定在进行
+    calib.value = { tip: calibrateTargets[target], left: 5 };
+    const dlg = dialog.info({
         title: "标定按钮位置",
-        content: `请先把鼠标移动到【${calibrateTargets[target]}】上，然后点「确定」记录位置。窗口移动或缩放后仍然有效。`,
-        positiveText: "确定（记录当前位置）",
-        negativeText: "取消",
-        onPositiveClick: async () => {
-            try {
-                await invoke("calibrate_point", { target });
+        content: () =>
+            h("div", { style: "white-space: pre-line" }, [
+                h("p", `请在 ${calib.value?.left ?? 0} 秒内，把鼠标移到下面这个按钮上并保持不动：`),
+                h("p", { style: "font-weight: 600; color: var(--primary-color)" }, calib.value?.tip ?? ""),
+                h("p", { style: "color: var(--n-text-color-disabled, #888); font-size: 12px" },
+                    "倒计时结束自动记录。认输②③需要先在 JJ 象棋里手动把菜单/弹窗点开。"),
+            ]),
+        positiveText: "取消",
+        onPositiveClick: () => stopCalib(),
+        onClose: () => stopCalib(),
+    });
+
+    function stopCalib() {
+        window.clearInterval(calibTimer);
+        calibTimer = undefined;
+        calib.value = null;
+    }
+
+    calibTimer = window.setInterval(() => {
+        if (!calib.value) return;
+        calib.value.left--;
+        if (calib.value.left > 0) return;
+        window.clearInterval(calibTimer);
+        calibTimer = undefined;
+        calib.value = null;
+        dlg.destroy();
+        invoke<[number, number]>("calibrate_point", { target })
+            .then(async ([cx, cy]) => {
                 await getAutoConfig();
                 dialog.success({
                     title: "标定成功",
-                    content: `已记录：${calibrateTargets[target]}`,
+                    content: `已记录：${calibrateTargets[target]}\n客户区坐标 (${cx}, ${cy})`,
                     positiveText: "好",
                 });
-            } catch (e) {
+            })
+            .catch((e) => {
                 dialog.error({
                     title: "标定失败",
                     content: String(e),
                     positiveText: "好",
                 });
-            }
-        },
-    });
+            });
+    }, 1000);
 }
 
 async function setAutoResignLimit() {
@@ -655,7 +704,7 @@ async function toggleEngine() {
         <n-space vertical size="small">
             <n-flex align="center" justify="space-between">
                 <n-space align="center" :size="8">
-                    <span class="app-title">中国象棋</span>
+                    <span class="app-title">弈谋</span>
                     <n-select
                         size="small"
                         v-model:value="mode"
@@ -870,6 +919,11 @@ async function toggleEngine() {
                             </n-tag>
                             <n-button size="tiny" tertiary @click="resetResignCount">重置</n-button>
                         </n-space>
+                    </n-form-item>
+                    <n-form-item v-if="autoNote" label="认输状态">
+                        <n-alert size="small" :type="autoNoteOk ? 'success' : 'warning'" :bordered="false">
+                            {{ autoNote }}
+                        </n-alert>
                     </n-form-item>
                     <n-form-item label="认输①入口" feedback="底部工具栏的「投降」入口">
                         <n-space align="center" :size="8">

@@ -1,5 +1,5 @@
 [package]
-name = "xqlink"
+name = "yimou"
 version = "0.1.2"
 description = "A Tauri App"
 authors = ["atopx <3940422@qq.com>", "aaay313"]
@@ -11,10 +11,10 @@ edition = "2024"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "xqlink_lib"
+name = "yimou_lib"
 # 只保留 staticlib 与 rlib：**不构建 cdylib**。
 #
-# 桌面端由 src/main.rs 静态链接 rlib 生成 xqlink.exe（见 main.rs），
+# 桌面端由 src/main.rs 静态链接 rlib 生成 yimou.exe（见 main.rs），
 # cdylib 只有移动端需要。但 Tauri 模板默认会带上 cdylib，而 cdylib 需要导出
 # 所有 command 符号 —— Windows 的导出序号上限是 65535，command 数量稍多
 # 就会链接失败（ld: export ordinal too large: 65559）。
@@ -52,14 +52,8 @@ tokio = { version = "1.44", default-features = false, features = [
 # 显式开启 std 后 build.rs 直接走 CARGO_FEATURE_STD 分支，不再探测。
 indexmap = { version = "1.9", features = ["std"] }
 
-[target.'cfg(target_os = "windows")'.dependencies]
-ort = { version = "=2.0.0-rc.9", default-features = false, features = ["ndarray", "load-dynamic"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-ort = { version = "=2.0.0-rc.9", features = ["coreml"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-ort = { version = "=2.0.0-rc.9", features = ["cuda", "load-dynamic"] }
+# 识别层已换为 vision.rs（确定性算法），不再需要 ONNX Runtime。
+# 保留 ort 依赖会继续要求 onnxruntime.dll 随包分发，因此整段移除。
 
 [profile.dev]
 incremental = true
@@ -67,11 +61,8 @@ incremental = true
 [features]
 default = []
 rotate = []
-gpu = [
-    "ort/copy-dylibs",
-    "ort/cuda",
-    "ort/directml"
-]
+# GPU 加速随 ONNX 一并移除；保留空 feature 以免既有构建脚本报错。
+gpu = []
 
 [profile.release]
 codegen-units = 1

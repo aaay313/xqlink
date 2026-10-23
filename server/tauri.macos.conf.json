@@ -6,5 +6,6 @@
             "../libs/pikafish/pikafish-macos",
             "../libs/pikafish/pikafish.nnue"
         ]
-    }
+    },
+    "productName": "Yimou"
 }

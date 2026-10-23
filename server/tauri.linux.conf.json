@@ -8,5 +8,6 @@
             "../libs/pikafish/pikafish-linux": "../libs/pikafish/pikafish-linux",
             "../libs/linux/libonnxruntime*.so": "./"
         }
-    }
+    },
+    "productName": "Yimou"
 }

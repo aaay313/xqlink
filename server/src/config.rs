@@ -123,9 +123,33 @@ impl Default for Config {
     }
 }
 
+/// 递归复制目录（std 没有现成实现，配置目录只有两层：config.json + games/）。
+fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            copy_dir(&from, &to)?;
+        } else if let Err(e) = fs::copy(&from, &to) {
+            tracing::warn!("迁移 {} 失败: {e}", from.display());
+        }
+    }
+    Ok(())
+}
+
 impl Config {
     pub fn load(base: &Path) -> Self {
-        let dir = base.join("xqlink");
+        let dir = base.join("yimou");
+        // 从旧版（xqlink）目录一次性迁移：认输点位等标定值是用户手工点出来的，
+        // 改名不该让它失效。
+        let legacy = base.join("xqlink");
+        if !dir.exists() && legacy.exists() {
+            if copy_dir(&legacy, &dir).is_ok() {
+                tracing::info!("已迁移旧配置目录 {} → {}", legacy.display(), dir.display());
+            }
+        }
         if !dir.exists() {
             let _ = fs::create_dir(&dir);
         };

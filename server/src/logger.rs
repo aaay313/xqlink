@@ -1,11 +1,8 @@
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Mutex;
-use std::sync::OnceLock;
 
 use tracing::Level;
-use tracing_appender::non_blocking;
 use tracing_appender::rolling;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::prelude::*;
@@ -13,15 +10,13 @@ use tracing_subscriber::registry;
 use tracing_subscriber::EnvFilter;
 
 #[cfg(target_os = "windows")]
-fn log_dir(home_dir: &Path) -> PathBuf { home_dir.join("AppData").join("Local").join("xqlink").join("logs") }
+fn log_dir(home_dir: &Path) -> PathBuf { home_dir.join("logs") }
 
 #[cfg(target_os = "macos")]
-fn log_dir(home_dir: &Path) -> PathBuf { home_dir.join("Library").join("Logs").join("xqlink") }
+fn log_dir(home_dir: &Path) -> PathBuf { home_dir.join("logs") }
 
 #[cfg(target_os = "linux")]
-fn log_dir(home_dir: &Path) -> PathBuf { home_dir.join(".local").join("share").join("xqlink").join("logs") }
-
-static APPENDER_GUARD: OnceLock<Mutex<Option<tracing_appender::non_blocking::WorkerGuard>>> = OnceLock::new();
+fn log_dir(home_dir: &Path) -> PathBuf { home_dir.join("logs") }
 
 /// 把配置项 `loglevel` 解析为 tracing 级别，默认 INFO。
 ///
@@ -44,7 +39,7 @@ pub fn init_tracer(level: Level, home_dir: &std::path::Path) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         // 默认过滤级别设置
         let filter_str = format!(
-            "{},xqlink={},xqlink_lib={},ort=warn,tower_http=warn,hyper=warn,hyper_util=warn,xcap=warn",
+            "{},yimou={},yimou_lib={},ort=warn,tower_http=warn,hyper=warn,hyper_util=warn,xcap=warn",
             level.as_str(),
             level.as_str(),
             level.as_str()
@@ -58,12 +53,11 @@ pub fn init_tracer(level: Level, home_dir: &std::path::Path) {
         fs::create_dir_all(&log_dir).expect("无法创建日志目录");
     }
 
-    // 设置每日滚动日志文件
+    // 设置每日滚动日志文件。
+    // 直接同步写：之前用 non_blocking 缓冲 + WorkerGuard，本程序是窗口进程，
+    // 退出时 guard 不可靠，实测日志整段丢失（文件 0 字节），事后无法排查。
+    // INFO 级别每 0.6s 至多几条，同步写的磁盘开销可以接受。
     let file_appender = rolling::daily(log_dir, "runtime.log");
-    let (non_blocking_file, _guard) = non_blocking(file_appender);
-
-    // 保存guard以确保日志写入器保持活跃
-    let _unused = APPENDER_GUARD.get_or_init(|| Mutex::new(Some(_guard))).lock().unwrap();
 
     // 创建控制台输出层
     let console_layer = tracing_subscriber::fmt::layer().with_span_events(FmtSpan::CLOSE).with_ansi(true).compact();
@@ -72,7 +66,7 @@ pub fn init_tracer(level: Level, home_dir: &std::path::Path) {
     let file_layer = tracing_subscriber::fmt::layer()
         .with_span_events(FmtSpan::CLOSE)
         .with_ansi(false)
-        .with_writer(non_blocking_file)
+        .with_writer(file_appender)
         .compact();
 
     // 组装并设置订阅者
