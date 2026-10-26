@@ -453,8 +453,6 @@ impl AnalysisContext {
             thread::sleep(Duration::from_millis(120));
         }
 
-        // 找一个与本次走子无关的空格，用于点击前清除残留选中态
-        let clear = empty_cell(&board, (from_row, from_col), (to_row, to_col));
         let ok = auto::play_move(
             &map,
             camp,
@@ -462,7 +460,6 @@ impl AnalysisContext {
             (to_row, to_col),
             mode,
             effective,
-            clear,
         );
         if ok {
             info!(
@@ -1089,30 +1086,6 @@ pub fn get_board(
     } else {
         None
     }
-}
-
-/// 找一个与本次着法无关的空格，用于点击前清除残留选中态。
-///
-/// 从棋盘中部向外找：中部空格在绝大多数局面下都存在，且离两端着法远，
-/// 误点导致的意外走子概率最低（空格本身不可走，点了只是取消选中）。
-fn empty_cell(board: &[[char; 9]; 10], from: (usize, usize), to: (usize, usize)) -> Option<(usize, usize)> {
-    let mut best: Option<((usize, usize), i32)> = None;
-    for r in 0..10 {
-        for c in 0..9 {
-            if board[r][c] != ' ' || (r, c) == from || (r, c) == to {
-                continue;
-            }
-            // 距离取到 from / to 的最小值，越大越安全
-            let d = |a: (usize, usize), b: (usize, usize)| -> i32 {
-                ((a.0 as i32 - b.0 as i32).abs()) + ((a.1 as i32 - b.1 as i32).abs())
-            };
-            let score = d((r, c), from).min(d((r, c), to));
-            if best.map(|(_, s)| score > s).unwrap_or(true) {
-                best = Some(((r, c), score));
-            }
-        }
-    }
-    best.map(|(p, _)| p)
 }
 
 /// 盘面哈希：长将防护用（同一盘面出现次数统计）。

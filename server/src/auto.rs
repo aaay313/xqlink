@@ -159,6 +159,9 @@ mod ffi {
     pub const WM_MOUSEMOVE: u32 = 0x0200;
     pub const WM_LBUTTONDOWN: u32 = 0x0201;
     pub const WM_LBUTTONUP: u32 = 0x0202;
+    pub const WM_KEYDOWN: u32 = 0x0100;
+    pub const WM_KEYUP: u32 = 0x0101;
+    pub const VK_ESCAPE: usize = 0x1B;
     pub const MK_LBUTTON: usize = 0x0001;
 }
 
@@ -510,6 +513,29 @@ fn find_render_child(_hwnd: u32) -> Option<u32> {
     None
 }
 
+/// 取消当前选中态：向渲染子窗口投递 ESC 键消息。
+///
+/// 为什么不用"点空格"：JJ 若恰好有一枚棋子处于选中状态，而那个空格正好是
+/// 它的合法落点，这一点就会**真的把棋子走出去** —— 表现为"自动走棋位置错了"。
+/// 键盘消息最坏情况是被忽略，绝不会产生落子副作用，因此用它做重试前的归零。
+#[cfg(target_os = "windows")]
+pub fn cancel_selection(hwnd: u32) -> bool {
+    let Some(child) = find_render_child(hwnd) else {
+        return false;
+    };
+    unsafe {
+        let h = child as *mut std::ffi::c_void;
+        ffi::PostMessageW(h, ffi::WM_KEYDOWN, ffi::VK_ESCAPE, 0);
+        ffi::PostMessageW(h, ffi::WM_KEYUP, ffi::VK_ESCAPE, 0);
+    }
+    true
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn cancel_selection(_hwnd: u32) -> bool {
+    false
+}
+
 /// 后台点击：向渲染子窗口投递鼠标消息。**不移动鼠标指针、不抢焦点**。
 ///
 /// 传入的坐标是顶层窗口客户区坐标；内部换算到子窗口客户区再投递。
@@ -600,7 +626,6 @@ pub fn play_move(
     to: (usize, usize),
     mode: PlayMode,
     input: InputMode,
-    clear: Option<(usize, usize)>,
 ) -> bool {
     match mode {
         // 拖拽依赖连续的移动轨迹，窗口消息难以还原，只走系统输入
@@ -640,17 +665,12 @@ pub fn play_move(
                 }
             };
 
-            // 先点一个空格清掉可能残留的选中态。
-            // JJ 的交互是「点棋子选中 → 点目标落子」；上一次尝试若在落子那步失败，
-            // 棋子仍处于选中状态，下一次重试的首击会把选中**取消**，导致必须
-            // 奇数次尝试才能成功（日志里 3 次、11 次成功正是这个模式）。
-            // 每次点击前先归零选中态，重试才是幂等的。
-            if let Some(cc) = clear {
-                if !click_cell(cc) {
-                    return false;
-                }
-                sleep(Duration::from_millis(150));
-            }
+            // 先把可能残留的选中态清掉（ESC），让每次重试都从同一状态开始。
+            // JJ 的交互是「点棋子选中 → 点目标落子」；上一次若在落子那步失败，
+            // 棋子仍是选中状态，下次重试的首击反而会取消选中，导致必须奇数次
+            // 尝试才能成功。ESC 归零没有落子风险（点空格会有）。
+            cancel_selection(map.hwnd);
+            sleep(Duration::from_millis(120));
             if !click_cell(from) {
                 return false;
             }
