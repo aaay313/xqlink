@@ -43,6 +43,8 @@ pub struct ListenWindow {
     y: u32,
     w: u32,
     h: u32,
+    /// 由棋子中心拟合的真实格点仿射系数（客户区图像像素）
+    lattice: Option<[f32; 6]>,
 
     /// 客户区图像（**未裁剪**）的尺寸。
     ///
@@ -63,6 +65,7 @@ impl ListenWindow {
                     y: 0,
                     w: 0,
                     h: 0,
+                    lattice: None,
                     client_size: std::cell::Cell::new((0, 0)),
                 });
             }
@@ -120,6 +123,17 @@ impl ListenWindow {
     /// 目标窗口句柄（自动点击前用它把窗口切到前台）。
     pub fn hwnd(&self) -> u32 {
         self.window.id().unwrap_or(0)
+    }
+
+    /// 由棋子中心拟合出的真实格点仿射（客户区图像像素）。
+    /// 语义：x = k[0] + k[1]*col + k[2]*row，y = k[3] + k[4]*col + k[5]*row。
+    /// None 表示未拟合成功，退回检测框外推。
+    pub fn lattice(&self) -> Option<[f32; 6]> {
+        self.lattice
+    }
+
+    pub fn set_lattice(&mut self, lattice: Option<[f32; 6]>) {
+        self.lattice = lattice;
     }
 
     pub fn set_sub_bound(&mut self, x: u32, y: u32, w: u32, h: u32) {

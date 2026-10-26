@@ -4,6 +4,7 @@ use std::hash::{Hash, Hasher};
 use std::thread;
 use std::time::Duration;
 
+use crate::yolo;
 use tauri::async_runtime::block_on;
 use tauri::AppHandle;
 use tauri::Emitter as _;
@@ -321,6 +322,7 @@ impl AnalysisContext {
             scale: self.window.scale_factor(),
             board_rect: (x, y, w, h),
             hwnd: self.window.hwnd(),
+            lattice: self.window.lattice(),
         })
     }
 
@@ -1088,6 +1090,134 @@ pub fn get_board(
     }
 }
 
+/// 由棋子检测框的中心拟合棋盘格点（二维仿射，含透视错切）。
+///
+/// 为什么必须用仿射：JJ 的 3D 皮肤不仅有缩放，列位置还随行轻微平移
+/// （透视）。单格距拟合的残差可达半格，顶部两行会整整偏一格 ——
+/// 用户看到的就是「自动走棋落点比分析结果低一行」。
+///
+/// 棋子必然落在格点上，所以用「列号、行号」作为自变量的最小二乘
+/// 就能解出 x = k0 + k1*col + k2*row、y = k3 + k4*col + k5*row。
+/// 列/行号沿用识别器同一套分配（模型网格），个别误分配由鲁棒迭代剔除。
+fn fit_lattice(
+    detections: &[yolo::Detection], crop_w: u32, crop_h: u32,
+) -> Option<[f32; 6]> {
+    let sx = crop_w as f32 / yolo::IMAGE_WIDTH as f32;
+    let sy = crop_h as f32 / yolo::IMAGE_HEIGHT as f32;
+    let cw = yolo::IMAGE_WIDTH as f32 / 9.0;
+    let ch = yolo::IMAGE_HEIGHT as f32 / 10.0;
+
+    // (x_img, y_img, col, row)，与 detections_to_board 同一分配规则
+    let mut pts: Vec<(f32, f32, f32, f32)> = Vec::new();
+    let mut used = [[false; 9]; 10];
+    for d in detections.iter().filter(|d| d.label != '0') {
+        let cxm = (d.x0 + d.x1) * 0.5;
+        let cym = (d.y0 + d.y1) * 0.5;
+        let col = (cxm / cw).floor();
+        let row = (cym / ch).floor();
+        if !(0.0..=8.0).contains(&col) || !(0.0..=9.0).contains(&row) {
+            continue;
+        }
+        let (ci, ri) = (col as usize, row as usize);
+        if used[ri][ci] {
+            continue;
+        }
+        used[ri][ci] = true;
+        pts.push((cxm * sx, cym * sy, col, row));
+    }
+    if pts.len() < 10 {
+        return None;
+    }
+
+    // 鲁棒迭代：先全量拟合，再剔除残差大的点重拟合（最多 3 轮）
+    let mut k = fit_affine(&pts)?;
+    for _ in 0..3 {
+        let mut kept = Vec::with_capacity(pts.len());
+        for &(x, y, c, r) in &pts {
+            let ex = (x - (k[0] + k[1] * c + k[2] * r)).abs();
+            let ey = (y - (k[3] + k[4] * c + k[5] * r)).abs();
+            if ex < 0.35 * k[1].abs().max(6.0) && ey < 0.35 * k[5].abs().max(6.0) {
+                kept.push((x, y, c, r));
+            }
+        }
+        if kept.len() < 10 || kept.len() == pts.len() {
+            break;
+        }
+        pts = kept;
+        if let Some(nk) = fit_affine(&pts) {
+            k = nk;
+        }
+    }
+
+    // 合理性校验：格距为正、量级与检测框推算值同档
+    let (gx, gy) = (k[1].abs().max(k[2].abs()), k[5].abs().max(k[4].abs()));
+    if gx < 10.0 || gy < 10.0 {
+        return None;
+    }
+    Some(k)
+}
+
+/// 三自变量最小二乘：x/y 分别对 (1, col, row) 回归。
+fn fit_affine(pts: &[(f32, f32, f32, f32)]) -> Option<[f32; 6]> {
+    // 正规方程 3x3：A = Σ [1,c,r]^T [1,c,r]
+    let mut a = [[0f64; 3]; 3];
+    let mut bx = [0f64; 3];
+    let mut by = [0f64; 3];
+    for &(x, y, c, r) in pts {
+        let v = [1.0f64, c as f64, r as f64];
+        for i in 0..3 {
+            for j in 0..3 {
+                a[i][j] += v[i] * v[j];
+            }
+            bx[i] += v[i] * x as f64;
+            by[i] += v[i] * y as f64;
+        }
+    }
+    let sol_x = solve3(a, bx)?;
+    let sol_y = solve3(a, by)?;
+    Some([
+        sol_x[0] as f32,
+        sol_x[1] as f32,
+        sol_x[2] as f32,
+        sol_y[0] as f32,
+        sol_y[1] as f32,
+        sol_y[2] as f32,
+    ])
+}
+
+/// 3x3 线性方程组（高斯消元，带部分主元）。
+fn solve3(mut a: [[f64; 3]; 3], mut b: [f64; 3]) -> Option<[f64; 3]> {
+    for i in 0..3 {
+        let mut p = i;
+        for r in i + 1..3 {
+            if a[r][i].abs() > a[p][i].abs() {
+                p = r;
+            }
+        }
+        if a[p][i].abs() < 1e-9 {
+            return None;
+        }
+        a.swap(i, p);
+        b.swap(i, p);
+        for r in i + 1..3 {
+            let f = a[r][i] / a[i][i];
+            for c in i..3 {
+                a[r][c] -= f * a[i][c];
+            }
+            b[r] -= f * b[i];
+        }
+    }
+    let mut x = [0f64; 3];
+    for i in (0..3).rev() {
+        let mut s = b[i];
+        for c in i + 1..3 {
+            s -= a[i][c] * x[c];
+        }
+        x[i] = s / a[i][i];
+    }
+    Some(x)
+}
+
 /// 盘面哈希：长将防护用（同一盘面出现次数统计）。
 fn board_key(board: &[[char; 9]; 10]) -> u64 {
     let mut h = DefaultHasher::new();
@@ -1619,6 +1749,30 @@ pub async fn start_listen(app: AppHandle, target: Window) -> Result<(), String> 
     match common::detections_bound(image_w, image_h, &detections) {
         Ok((x, y, w, h)) => {
             window.set_sub_bound(x, y, w, h); // 设置窗口边界
+            // 由棋子中心拟合真实格点：3D/透视皮肤下检测框与格点不等比，
+            // 用检测框线性外推会让棋盘边缘（尤其顶部两行）点击偏一格。
+            //
+            // 必须在**裁剪后的棋盘帧**上重跑一次识别：模型把输入拉伸到 640×640，
+            // 只有裁剪帧里"棋盘铺满整幅"这个前提成立，列/行号分配才有意义；
+            // 全窗口检测的坐标里棋盘只占中间一块，按 640/9 分列会算错。
+            let lattice = window
+                .capture()
+                .and_then(|crop| {
+                    let (cw, ch) = (crop.width(), crop.height());
+                    predict(crop).ok().map(|dets| (cw, ch, dets))
+                })
+                .and_then(|(cw, ch, dets)| {
+                    fit_lattice(&dets, cw, ch)
+                        .map(|k| [k[0] + x as f32, k[1], k[2], k[3] + y as f32, k[4], k[5]])
+                });
+            match lattice {
+                Some(k) => info!(
+                    "格点拟合成功：x={:.1}+{:.2}*col+{:.2}*row, y={:.1}+{:.2}*col+{:.2}*row",
+                    k[0], k[1], k[2], k[3], k[4], k[5]
+                ),
+                None => warn!("格点拟合失败，退回检测框外推（边缘可能偏一格）"),
+            }
+            window.set_lattice(lattice);
         }
         Err(e) => {
             return Err(e); // 未识别到棋盘

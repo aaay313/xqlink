@@ -197,6 +197,10 @@ pub struct ScreenMap {
     pub scale: f32,
     /// 棋盘裁剪区（客户区图像坐标）：(x, y, w, h)
     pub board_rect: (u32, u32, u32, u32),
+    /// 由棋子中心拟合的格点仿射系数（客户区图像像素）：
+    /// x = k[0] + k[1]*col + k[2]*row；y = k[3] + k[4]*col + k[5]*row。
+    /// 有值时优先使用 —— 3D/透视皮肤的格点与检测框并不等比，外推会在边缘偏一格。
+    pub lattice: Option<[f32; 6]>,
     /// 目标窗口句柄（窗口消息方式需要）。
     pub hwnd: u32,
 }
@@ -224,9 +228,17 @@ impl ScreenMap {
         if bw == 0 || bh == 0 {
             return None;
         }
-        // 裁剪区内的像素位置
-        let px = bw as f32 * (img_col as f32 + 1.0) / 10.0;
-        let py = bh as f32 * (img_row as f32 + 1.0) / 11.0;
+        // 有拟合的仿射格点就直接用（可表达缩放 + 透视错切）
+        let (px, py) = match self.lattice {
+            Some(k) => (
+                k[0] + k[1] * img_col as f32 + k[2] * img_row as f32,
+                k[3] + k[4] * img_col as f32 + k[5] * img_row as f32,
+            ),
+            None => (
+                bw as f32 * (img_col as f32 + 1.0) / 10.0,
+                bh as f32 * (img_row as f32 + 1.0) / 11.0,
+            ),
+        };
         // → 客户区图像坐标 → 客户区物理坐标
         let cx = (bx as f32 + px) / self.scale;
         let cy = (by as f32 + py) / self.scale;
@@ -696,6 +708,7 @@ mod tests {
             scale: 1.0,
             board_rect: (10, 20, 300, 330),
             hwnd: 0,
+            lattice: None,
         }
     }
 
