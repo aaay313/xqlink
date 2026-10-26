@@ -107,6 +107,9 @@ struct AnalysisContext {
     seen_boards: HashMap<u64, u32>,
     /// 「轮到我方」盘面的出现次数。>0 说明这个局面已经循环过至少一圈
     turn_boards: HashMap<u64, u32>,
+    /// 我方最近走过的着法（from,to）。用于打断「来回将」：
+    /// 长将不一定造成完全相同的盘面（识别抖动会让哈希变），但一定会重复同一手。
+    recent_moves: VecDeque<(String, String)>,
     /// 后台消息通道已确认无效 → 跳过（降级后置位）。
     message_input_broken: bool,
     /// 触摸注入通道已确认无效 → 跳过（降级后置位）。
@@ -160,6 +163,7 @@ impl AnalysisContext {
             resign_on_start_checked: false,
             seen_boards: HashMap::new(),
             turn_boards: HashMap::new(),
+            recent_moves: VecDeque::new(),
             message_input_broken: false,
             touch_broken: false,
             auto_fail_boards: 0,
@@ -213,6 +217,9 @@ impl AnalysisContext {
         let captured = started.elapsed();
 
         let hash = image_hash(&image);
+        // get_board 需要所有权；颜色守卫还要用原图，因此先复制一份。
+        // 单帧 1~3MB 的拷贝在 0.6s 周期下开销可忽略。
+        let image_for_color = image.clone();
         let result = get_board(image);
 
         // 刷新窗口几何：自动点击换算屏幕坐标、标定认输按钮都要用，
@@ -224,6 +231,9 @@ impl AnalysisContext {
 
         let prev_board = self.last_board;
         result.map(|(camp, board, conf)| {
+            // 颜色一致性守卫：模型偶发把红子判成黑子（「对面的炮识别成我的棋子」）。
+            // 同帧内同类棋子的字形颜色高度一致，用墨迹像素的 R-G 判色可直接纠回。
+            let board = fix_colors(&image_for_color, self.window.lattice(), self.window.board_bound(), camp, board);
             // 易混类别低置信度兜底（纠正"把兵认成马"这类同格换类误判），
             // 再做多帧投票过滤偶发误判，最后用规则纠错兜底明显错误
             let board = stabilize_confusable(board, conf, prev_board);
@@ -286,6 +296,26 @@ impl AnalysisContext {
         // 优先打破循环 —— 覆盖"同一位置连续将不超过 5 步"的规则。
         let h0 = board_key(&board);
         let repeated = self.turn_boards.get(&h0).copied().unwrap_or(0) > 0;
+
+        // 打断「来回将」：若引擎首选就是我方最近 3 手内走过的同一手，
+        // 换成第一个没重复过的候选。长将判负的根因是**重复同一手将军**
+        // （盘面未必完全重复，尤其识别有抖动时），因此按着法去重比按盘面可靠。
+        if let Some(r) = result.as_mut()
+            && r.pvs.len() > 1
+            && let Some(best) = r.pvs.first()
+            && let Some((bf, bt)) = split_iccs(best)
+            && self.recent_moves.iter().rev().take(3).any(|(f, t)| *f == bf && *t == bt)
+        {
+            if let Some(pos) = r
+                .pvs
+                .iter()
+                .position(|pv| split_iccs(pv).map(|(f, t)| !self.recent_moves.iter().rev().take(3).any(|(rf, rt)| *rf == f && *rt == t)).unwrap_or(false))
+            {
+                info!("检测到重复着法 {}，改用候选 {}（防长将）", best, r.pvs[pos]);
+                r.pvs.swap(0, pos);
+            }
+        }
+
         if repeated
             && let Some(r) = result.as_mut()
             && r.pvs.len() > 1
@@ -299,6 +329,12 @@ impl AnalysisContext {
 
         let (expect_move, expect_board) =
             analyse(&self.app, result.unwrap(), board, self.our_turn)?;
+
+        // 记录我方这一手（用于打断来回将），只保留最近 12 手
+        self.recent_moves.push_back((expect_move.from.clone(), expect_move.to.clone()));
+        if self.recent_moves.len() > 12 {
+            self.recent_moves.pop_front();
+        }
 
         // 登记走后的盘面与本局面的出现次数；防抖表过大时清空重建
         *self.seen_boards.entry(board_key(&expect_board)).or_insert(0) += 1;
@@ -1218,6 +1254,157 @@ fn solve3(mut a: [[f64; 3]; 3], mut b: [f64; 3]) -> Option<[f64; 3]> {
     Some(x)
 }
 
+/// 颜色一致性守卫：按墨迹像素的色相纠正红/黑判反的棋子。
+///
+/// 依据：同一皮肤下，红子笔画 R 明显大于 G（实测 R-G 25~105），
+/// 黑子笔画近似中性（R-G 3~7）。该判据与字形无关，只判颜色，
+/// 因此对「红炮被判成黑炮」这类错误非常可靠。
+///
+/// 保守约束（避免把正确的棋子改错）：
+/// - 只改颜色、不改类别；将/帅（字形本就不同）不参与
+/// - 墨迹像素少于 60 视为无子/遮挡，跳过
+/// - R-G 落在模糊带（10~15）时跳过
+/// - 改判后棋子数量必须仍符合棋规上限
+fn fix_colors(
+    img: &ImageBuffer<Rgba<u8>, Vec<u8>>,
+    lattice: Option<[f32; 6]>,
+    bound: Option<(u32, u32, u32, u32)>,
+    camp: chess::Camp,
+    board: [[char; 9]; 10],
+) -> [[char; 9]; 10] {
+    let Some((bx, by, bw, bh)) = bound else { return board };
+    if bw == 0 || bh == 0 {
+        return board;
+    }
+    // 格子中心（裁剪帧坐标）
+    let center = |row: usize, col: usize| -> (f32, f32) {
+        match lattice {
+            Some(k) => (
+                k[0] + k[1] * col as f32 + k[2] * row as f32 - bx as f32,
+                k[3] + k[4] * col as f32 + k[5] * row as f32 - by as f32,
+            ),
+            None => (
+                (bw as f32 * (col as f32 + 1.0) / 10.0),
+                (bh as f32 * (row as f32 + 1.0) / 11.0),
+            ),
+        }
+    };
+    let half = (bw.min(bh) as f32 / 11.0 * 0.42).max(6.0);
+
+    let limits = |ch: char| -> usize {
+        match ch.to_ascii_lowercase() {
+            'k' => 1,
+            'r' | 'n' | 'c' | 'a' | 'b' => 2,
+            'p' => 5,
+            _ => 0,
+        }
+    };
+    let mut counts = [[0usize; 7]; 2]; // [0]=红 [1]=黑，按 class_index
+    let class_idx = |ch: char| -> Option<usize> {
+        Some(match ch.to_ascii_lowercase() {
+            'k' => 0, 'a' => 1, 'b' => 2, 'n' => 3, 'r' => 4, 'c' => 5, 'p' => 6,
+            _ => return None,
+        })
+    };
+    for r in 0..10 {
+        for c in 0..9 {
+            let ch = board[r][c];
+            if let Some(i) = class_idx(ch) {
+                counts[if ch.is_ascii_uppercase() { 0 } else { 1 }][i] += 1;
+            }
+        }
+    }
+
+    let mut out = board;
+    for r in 0..10 {
+        for c in 0..9 {
+            let ch = board[r][c];
+            if ch == ' ' || ch.eq_ignore_ascii_case(&'k') {
+                continue;
+            }
+            // board 是「我方视角」：执黑时行列整体翻转，取像素必须同样翻转，
+            // 否则会把纠正写到镜像格子上（比不纠正更糟）。
+            let (sr, sc) = if camp.eq(&chess::Camp::Black) {
+                (9 - r, 8 - c)
+            } else {
+                (r, c)
+            };
+            let (cx, cy) = center(sr, sc);
+            let (Some(rg), Some(ink)) = glyph_rg(img, cx, cy, half) else { continue };
+            if ink < 60 {
+                continue;
+            }
+            // 判色：R-G > 15 红；< 10 黑；其余模糊带跳过
+            let is_red = if rg > 15.0 {
+                true
+            } else if rg < 10.0 {
+                false
+            } else {
+                continue;
+            };
+            let classified_red = ch.is_ascii_uppercase();
+            if is_red == classified_red {
+                continue;
+            }
+            // 改判后数量必须合法
+            let Some(ci) = class_idx(ch) else { continue };
+            let from_color = if classified_red { 0 } else { 1 };
+            let to_color = if is_red { 0 } else { 1 };
+            if counts[to_color][ci] + 1 > limits(ch) || counts[from_color][ci] == 0 {
+                continue;
+            }
+            let fixed = if is_red { ch.to_ascii_uppercase() } else { ch.to_ascii_lowercase() };
+            counts[from_color][ci] -= 1;
+            counts[to_color][ci] += 1;
+            out[r][c] = fixed;
+            info!(
+                "颜色纠正 {}{}：{} → {}（R-G={:.1}, 墨点 {}）",
+                (b'a' + c as u8) as char, 9 - r + 1, ch, fixed, rg, ink
+            );
+        }
+    }
+    out
+}
+
+/// 取格子中心区域「墨迹像素」的平均 R-G 与墨点数量。
+fn glyph_rg(
+    img: &ImageBuffer<Rgba<u8>, Vec<u8>>, cx: f32, cy: f32, half: f32,
+) -> (Option<f32>, Option<usize>) {
+    let (w, h) = (img.width(), img.height());
+    let x0 = (cx - half).max(0.0) as u32;
+    let x1 = ((cx + half) as u32).min(w.saturating_sub(1));
+    let y0 = (cy - half).max(0.0) as u32;
+    let y1 = ((cy + half) as u32).min(h.saturating_sub(1));
+    if x1 <= x0 || y1 <= y0 {
+        return (None, None);
+    }
+    let (mut sum, mut ink) = (0f32, 0usize);
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let p = img.get_pixel(x, y);
+            let (r, g, b) = (p[0] as f32, p[1] as f32, p[2] as f32);
+            let l = 0.299 * r + 0.587 * g + 0.114 * b;
+            if l < 130.0 {
+                sum += r - g;
+                ink += 1;
+            }
+        }
+    }
+    if ink == 0 {
+        (None, Some(0))
+    } else {
+        (Some(sum / ink as f32), Some(ink))
+    }
+}
+
+/// 把 ICCS 着法拆成 (起点, 终点)，如 "b0c2" -> ("b0","c2")。
+fn split_iccs(iccs: &str) -> Option<(String, String)> {
+    if iccs.len() != 4 {
+        return None;
+    }
+    Some((iccs[0..2].to_string(), iccs[2..4].to_string()))
+}
+
 /// 盘面哈希：长将防护用（同一盘面出现次数统计）。
 fn board_key(board: &[[char; 9]; 10]) -> u64 {
     let mut h = DefaultHasher::new();
@@ -1550,6 +1737,8 @@ fn process_analysis_loop(mut context: AnalysisContext) {
                         context.resigned_this_game = false;
                         context.seen_boards.clear();
                         context.turn_boards.clear();
+                        context.recent_moves.clear();
+                        context.recent_moves.clear();
                         // 我方执红 = 我方先手，棋局刚开局就能认输，直接认输
                         if context.should_resign_now() {
                             context.try_resign();
@@ -1574,6 +1763,8 @@ fn process_analysis_loop(mut context: AnalysisContext) {
                         context.resigned_this_game = false;
                         context.seen_boards.clear();
                         context.turn_boards.clear();
+                        context.recent_moves.clear();
+                        context.recent_moves.clear();
                     }
                     context.last_board = board;
                     context.update_ui(&camp, board);
