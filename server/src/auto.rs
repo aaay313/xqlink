@@ -228,20 +228,23 @@ impl ScreenMap {
         if bw == 0 || bh == 0 {
             return None;
         }
-        // 有拟合的仿射格点就直接用（可表达缩放 + 透视错切）
+        // 两条路径的坐标系不同，必须分开处理：
+        // - 拟合格点：已是**客户区图像绝对坐标**（拟合时已加过裁剪偏移）
+        // - 旧外推：是**裁剪区内的相对坐标**，要再加 (bx, by)
+        // 之前把拟合值也加了 bbox 偏移，等于整体平移一段，表现为"点哪都不动"。
         let (px, py) = match self.lattice {
             Some(k) => (
                 k[0] + k[1] * img_col as f32 + k[2] * img_row as f32,
                 k[3] + k[4] * img_col as f32 + k[5] * img_row as f32,
             ),
             None => (
-                bw as f32 * (img_col as f32 + 1.0) / 10.0,
-                bh as f32 * (img_row as f32 + 1.0) / 11.0,
+                bx as f32 + bw as f32 * (img_col as f32 + 1.0) / 10.0,
+                by as f32 + bh as f32 * (img_row as f32 + 1.0) / 11.0,
             ),
         };
         // → 客户区图像坐标 → 客户区物理坐标
-        let cx = (bx as f32 + px) / self.scale;
-        let cy = (by as f32 + py) / self.scale;
+        let cx = px / self.scale;
+        let cy = py / self.scale;
         Some((cx.round() as i32, cy.round() as i32))
     }
 
