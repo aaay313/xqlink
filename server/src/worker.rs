@@ -100,6 +100,8 @@ struct AnalysisContext {
     resigned_this_game: bool,
     /// 上一次尝试自动认输的时间。失败后限流重试，避免每帧狂点。
     last_resign_try: Option<std::time::Instant>,
+    /// 本次监听是否已处理过「开始即投降」。每次点「开始分析」只处理一次。
+    resign_on_start_checked: bool,
     /// 「我方走后」盘面的出现次数（长将防护用，哈希 -> 次数）
     seen_boards: HashMap<u64, u32>,
     /// 「轮到我方」盘面的出现次数。>0 说明这个局面已经循环过至少一圈
@@ -108,6 +110,14 @@ struct AnalysisContext {
     message_input_broken: bool,
     /// 触摸注入通道已确认无效 → 跳过（降级后置位）。
     touch_broken: bool,
+    /// 当前通道连续失败过的**不同**棋盘数。
+    ///
+    /// 不能用「同一手棋重试 3 次失败」来判通道死刑：JJ 的落子偶发被忽略
+    /// （动画/焦点时序），同一手 3 次失败很常见。只有连续多手棋、多个不同
+    /// 局面都走不动，才能断定这个通道真的不通。
+    auto_fail_boards: u32,
+    /// 上一次已计入失败统计的棋盘（同一棋盘只计一次）
+    last_fail_board: Option<u64>,
 }
 
 /// 一次自动走棋尝试的状态。
@@ -146,10 +156,13 @@ impl AnalysisContext {
             auto_attempt: None,
             resigned_this_game: false,
             last_resign_try: None,
+            resign_on_start_checked: false,
             seen_boards: HashMap::new(),
             turn_boards: HashMap::new(),
             message_input_broken: false,
             touch_broken: false,
+            auto_fail_boards: 0,
+            last_fail_board: None,
         }
     }
 
@@ -339,7 +352,10 @@ impl AnalysisContext {
         expect: &chess::Changed,
     ) {
         const RETRY_INTERVAL: Duration = Duration::from_millis(1500);
+        /// 同一棋盘重试到第几次就认定「这一手没走成」
         const DOWNGRADE_AFTER: u32 = 3;
+        /// 连续多少个不同局面走不成，才判定当前通道不可用并降级
+        const FAIL_BOARDS: u32 = 3;
 
         let (enabled, mode, configured_input) = {
             let config = SHARED_STATE.get().unwrap().config.read().unwrap();
@@ -365,27 +381,43 @@ impl AnalysisContext {
                 }
                 let tries = att.tries + 1;
                 let mut eff = att.input;
-                // 降级阶梯：后台消息 -> 触摸注入 -> 系统输入。
-                // 每级给 DOWNGRADE_AFTER 次机会，确认无效才降下一级。
-                if matches!(eff, auto::InputMode::Auto | auto::InputMode::Message)
-                    && tries >= DOWNGRADE_AFTER
-                {
-                    self.message_input_broken = true;
-                    if self.touch_broken {
-                        warn!("后台消息连续 {} 次未生效且触摸已失效，改用系统输入", tries);
-                        eff = auto::InputMode::SendInput;
-                    } else {
-                        warn!("后台消息连续 {} 次未生效，改用触摸注入（不动鼠标）", tries);
-                        eff = auto::InputMode::Touch;
+
+                // 同一棋盘的重试超过阈值 → 把这**一个棋盘**计入失败，
+                // 但不立刻换通道（偶发忽略很常见）。
+                if tries >= DOWNGRADE_AFTER {
+                    let key = board_key(&board);
+                    if self.last_fail_board != Some(key) {
+                        self.last_fail_board = Some(key);
+                        self.auto_fail_boards += 1;
                     }
-                } else if eff == auto::InputMode::Touch && tries >= DOWNGRADE_AFTER {
-                    self.touch_broken = true;
-                    warn!("触摸注入连续 {} 次未生效，改用系统输入", tries);
-                    eff = auto::InputMode::SendInput;
+                    // 连续 FAIL_BOARDS 个不同局面都走不动 → 才换下一级通道
+                    if self.auto_fail_boards >= FAIL_BOARDS {
+                        self.auto_fail_boards = 0;
+                        if matches!(eff, auto::InputMode::Auto | auto::InputMode::Message) {
+                            self.message_input_broken = true;
+                            eff = if self.touch_broken {
+                                warn!("后台点击在 {} 个局面均无效，改用系统输入", FAIL_BOARDS);
+                                auto::InputMode::SendInput
+                            } else {
+                                warn!("后台点击在 {} 个局面均无效，改用触摸注入", FAIL_BOARDS);
+                                auto::InputMode::Touch
+                            };
+                        } else if eff == auto::InputMode::Touch {
+                            self.touch_broken = true;
+                            warn!("触摸注入在 {} 个局面均无效，改用系统输入", FAIL_BOARDS);
+                            eff = auto::InputMode::SendInput;
+                        }
+                    }
                 }
                 (tries, eff)
             }
-            _ => (0, configured_input),
+            _ => {
+                // 盘面变了 → 说明上一次自动走棋已生效（或对方已走），
+                // 清空失败计数，让通道保持在当前级别。
+                self.auto_fail_boards = 0;
+                self.last_fail_board = None;
+                (0, configured_input)
+            }
         };
         // 已确认无效的通道直接跳过：消息 -> 触摸 -> 系统输入
         if matches!(effective, auto::InputMode::Auto | auto::InputMode::Message)
@@ -421,6 +453,8 @@ impl AnalysisContext {
             thread::sleep(Duration::from_millis(120));
         }
 
+        // 找一个与本次走子无关的空格，用于点击前清除残留选中态
+        let clear = empty_cell(&board, (from_row, from_col), (to_row, to_col));
         let ok = auto::play_move(
             &map,
             camp,
@@ -428,6 +462,7 @@ impl AnalysisContext {
             (to_row, to_col),
             mode,
             effective,
+            clear,
         );
         if ok {
             info!(
@@ -1056,6 +1091,30 @@ pub fn get_board(
     }
 }
 
+/// 找一个与本次着法无关的空格，用于点击前清除残留选中态。
+///
+/// 从棋盘中部向外找：中部空格在绝大多数局面下都存在，且离两端着法远，
+/// 误点导致的意外走子概率最低（空格本身不可走，点了只是取消选中）。
+fn empty_cell(board: &[[char; 9]; 10], from: (usize, usize), to: (usize, usize)) -> Option<(usize, usize)> {
+    let mut best: Option<((usize, usize), i32)> = None;
+    for r in 0..10 {
+        for c in 0..9 {
+            if board[r][c] != ' ' || (r, c) == from || (r, c) == to {
+                continue;
+            }
+            // 距离取到 from / to 的最小值，越大越安全
+            let d = |a: (usize, usize), b: (usize, usize)| -> i32 {
+                ((a.0 as i32 - b.0 as i32).abs()) + ((a.1 as i32 - b.1 as i32).abs())
+            };
+            let score = d((r, c), from).min(d((r, c), to));
+            if best.map(|(_, s)| score > s).unwrap_or(true) {
+                best = Some(((r, c), score));
+            }
+        }
+    }
+    best.map(|(p, _)| p)
+}
+
 /// 盘面哈希：长将防护用（同一盘面出现次数统计）。
 fn board_key(board: &[[char; 9]; 10]) -> u64 {
     let mut h = DefaultHasher::new();
@@ -1224,6 +1283,20 @@ fn process_analysis_loop(mut context: AnalysisContext) {
                             context.confirm_fail_count
                         );
                         context.confirm_fail_count = 0;
+                    }
+
+                    // 开始分析就投降：认输额度还有剩余时，直接执行一次，
+                    // 不必等识别到新开局，也不必手点「立即认输」。
+                    // 每次「开始分析」只处理一次，投降后继续走正常流程。
+                    if !context.resign_on_start_checked {
+                        context.resign_on_start_checked = true;
+                        if context.should_resign_now() {
+                            info!("开始分析时认输额度仍有剩余 → 立即自动投降");
+                            context.try_resign();
+                            context.resigned_this_game = true;
+                            // 投降后盘面会变化，回到 Initial 重新识别
+                            continue;
+                        }
                     }
 
                     // 在覆盖 last_board 之前留存上一份盘面：

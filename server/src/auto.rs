@@ -600,54 +600,11 @@ pub fn play_move(
     to: (usize, usize),
     mode: PlayMode,
     input: InputMode,
+    clear: Option<(usize, usize)>,
 ) -> bool {
     match mode {
-        PlayMode::Click => match input {
-            // Message / Auto：后台点击 —— 向 Chromium 渲染子窗口投递鼠标消息，
-            // 不移动鼠标指针、不抢焦点。对顶层窗口发消息无效，但对渲染子窗口
-            // 未必（Chromium 的输入汇点就是它）。未生效时由 worker 重试降级。
-            InputMode::Message | InputMode::Auto => {
-                let Some((fcx, fcy)) = map.board_to_client(camp, from.0, from.1) else {
-                    return false;
-                };
-                let Some((tcx, tcy)) = map.board_to_client(camp, to.0, to.1) else {
-                    return false;
-                };
-                if !post_click_background(map.hwnd, fcx, fcy) {
-                    return false;
-                }
-                sleep(Duration::from_millis(220));
-                post_click_background(map.hwnd, tcx, tcy)
-            }
-            InputMode::Touch => {
-                let Some((fx, fy)) = map.board_to_screen(camp, from.0, from.1) else {
-                    return false;
-                };
-                let Some((tx, ty)) = map.board_to_screen(camp, to.0, to.1) else {
-                    return false;
-                };
-                if !touch_tap(fx, fy) {
-                    return false;
-                }
-                sleep(Duration::from_millis(220));
-                touch_tap(tx, ty)
-            }
-            InputMode::SendInput => {
-                let Some((fx, fy)) = map.board_to_screen(camp, from.0, from.1) else {
-                    return false;
-                };
-                let Some((tx, ty)) = map.board_to_screen(camp, to.0, to.1) else {
-                    return false;
-                };
-                if !click_at_restoring(fx, fy) {
-                    return false;
-                }
-                sleep(Duration::from_millis(220));
-                click_at_restoring(tx, ty)
-            }
-        },
+        // 拖拽依赖连续的移动轨迹，窗口消息难以还原，只走系统输入
         PlayMode::Drag => {
-            // 拖拽依赖连续的移动轨迹，窗口消息难以还原，只走系统输入
             let Some((fx, fy)) = map.board_to_screen(camp, from.0, from.1) else {
                 return false;
             };
@@ -655,6 +612,50 @@ pub fn play_move(
                 return false;
             };
             drag_from_to(fx, fy, tx, ty, 12)
+        }
+        PlayMode::Click => {
+            // 三个通道只是「怎么点」不同，点哪些格子/间隔完全一致。
+            let click_cell = |cell: (usize, usize)| -> bool {
+                match input {
+                    // Message / Auto：后台点击 —— 向 Chromium 渲染子窗口投递鼠标
+                    // 消息，不移动鼠标指针、不抢焦点。
+                    InputMode::Message | InputMode::Auto => {
+                        let Some((cx, cy)) = map.board_to_client(camp, cell.0, cell.1) else {
+                            return false;
+                        };
+                        post_click_background(map.hwnd, cx, cy)
+                    }
+                    InputMode::Touch => {
+                        let Some((x, y)) = map.board_to_screen(camp, cell.0, cell.1) else {
+                            return false;
+                        };
+                        touch_tap(x, y)
+                    }
+                    InputMode::SendInput => {
+                        let Some((x, y)) = map.board_to_screen(camp, cell.0, cell.1) else {
+                            return false;
+                        };
+                        click_at_restoring(x, y)
+                    }
+                }
+            };
+
+            // 先点一个空格清掉可能残留的选中态。
+            // JJ 的交互是「点棋子选中 → 点目标落子」；上一次尝试若在落子那步失败，
+            // 棋子仍处于选中状态，下一次重试的首击会把选中**取消**，导致必须
+            // 奇数次尝试才能成功（日志里 3 次、11 次成功正是这个模式）。
+            // 每次点击前先归零选中态，重试才是幂等的。
+            if let Some(cc) = clear {
+                if !click_cell(cc) {
+                    return false;
+                }
+                sleep(Duration::from_millis(150));
+            }
+            if !click_cell(from) {
+                return false;
+            }
+            sleep(Duration::from_millis(220));
+            click_cell(to)
         }
     }
 }
