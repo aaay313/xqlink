@@ -104,8 +104,10 @@ struct AnalysisContext {
     seen_boards: HashMap<u64, u32>,
     /// 「轮到我方」盘面的出现次数。>0 说明这个局面已经循环过至少一圈
     turn_boards: HashMap<u64, u32>,
-    /// 窗口消息方式对本程序无效（自绘 + 原始输入）→ 永久改用系统输入。
+    /// 后台消息通道已确认无效 → 跳过（降级后置位）。
     message_input_broken: bool,
+    /// 触摸注入通道已确认无效 → 跳过（降级后置位）。
+    touch_broken: bool,
 }
 
 /// 一次自动走棋尝试的状态。
@@ -147,6 +149,7 @@ impl AnalysisContext {
             seen_boards: HashMap::new(),
             turn_boards: HashMap::new(),
             message_input_broken: false,
+            touch_broken: false,
         }
     }
 
@@ -362,24 +365,39 @@ impl AnalysisContext {
                 }
                 let tries = att.tries + 1;
                 let mut eff = att.input;
-                // 只有窗口消息类通道才降级；触摸注入是独立通道，不该被顶掉
-                if matches!(
-                    eff,
-                    auto::InputMode::Auto | auto::InputMode::Message
-                ) && tries >= DOWNGRADE_AFTER
+                // 降级阶梯：后台消息 -> 触摸注入 -> 系统输入。
+                // 每级给 DOWNGRADE_AFTER 次机会，确认无效才降下一级。
+                if matches!(eff, auto::InputMode::Auto | auto::InputMode::Message)
+                    && tries >= DOWNGRADE_AFTER
                 {
-                    warn!("自动走棋 {:?} 连续 {} 次未生效，改用系统输入", eff, tries);
-                    eff = auto::InputMode::SendInput;
                     self.message_input_broken = true;
+                    if self.touch_broken {
+                        warn!("后台消息连续 {} 次未生效且触摸已失效，改用系统输入", tries);
+                        eff = auto::InputMode::SendInput;
+                    } else {
+                        warn!("后台消息连续 {} 次未生效，改用触摸注入（不动鼠标）", tries);
+                        eff = auto::InputMode::Touch;
+                    }
+                } else if eff == auto::InputMode::Touch && tries >= DOWNGRADE_AFTER {
+                    self.touch_broken = true;
+                    warn!("触摸注入连续 {} 次未生效，改用系统输入", tries);
+                    eff = auto::InputMode::SendInput;
                 }
                 (tries, eff)
             }
             _ => (0, configured_input),
         };
-        // 已确认窗口消息无效 → 一律用系统输入（触摸是独立通道，不受影响）
-        if self.message_input_broken
-            && matches!(effective, auto::InputMode::Auto | auto::InputMode::Message)
+        // 已确认无效的通道直接跳过：消息 -> 触摸 -> 系统输入
+        if matches!(effective, auto::InputMode::Auto | auto::InputMode::Message)
+            && self.message_input_broken
         {
+            effective = if self.touch_broken {
+                auto::InputMode::SendInput
+            } else {
+                auto::InputMode::Touch
+            };
+        }
+        if effective == auto::InputMode::Touch && self.touch_broken {
             effective = auto::InputMode::SendInput;
         }
 
@@ -395,9 +413,12 @@ impl AnalysisContext {
             at: now,
         });
 
-        // 系统输入必须让目标窗口在前台；窗口消息直接发给目标窗口，不必抢焦点
-        if effective == auto::InputMode::SendInput {
+        // 系统输入与触摸注入都必须让目标窗口在前台（否则点击落在别的窗口上，
+        // 表现为"有时不走"）；窗口消息直接发给目标窗口，不必抢焦点。
+        // 抢焦点后留 120ms 激活稳定窗，消除首击落空。
+        if effective != auto::InputMode::Message {
             auto::focus_window(self.window.hwnd());
+            thread::sleep(Duration::from_millis(120));
         }
 
         let ok = auto::play_move(

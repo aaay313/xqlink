@@ -560,10 +560,10 @@ const playModeOptions = [
 ];
 
 const inputModeOptions = [
-    { label: "系统输入（兼容性最好，推荐）", value: "sendinput" },
-    { label: "触摸注入（不移动鼠标指针，需实测）", value: "touch" },
-    { label: "自动（先试窗口消息，无效再降级）", value: "auto" },
-    { label: "仅窗口消息（对 QQ 小程序无效）", value: "message" },
+    { label: "自动（后台点击→触摸→系统输入，推荐）", value: "auto" },
+    { label: "后台点击（不动鼠标不抢焦点，需实测）", value: "message" },
+    { label: "触摸注入（不动鼠标，但需 JJ 在前台）", value: "touch" },
+    { label: "系统输入（动鼠标，兼容性最好）", value: "sendinput" },
 ];
 
 async function getAutoConfig() {

@@ -64,6 +64,7 @@ mod ffi {
         pub fn SetForegroundWindow(hwnd: *mut c_void) -> i32;
         pub fn ShowWindow(hwnd: *mut c_void, cmd: i32) -> i32;
         pub fn PostMessageW(hwnd: *mut c_void, msg: u32, wparam: usize, lparam: isize) -> i32;
+        pub fn FindWindowExW(parent: *mut c_void, after: *mut c_void, class: *const u16, title: *const u16) -> *mut c_void;
         pub fn SendMessageW(hwnd: *mut c_void, msg: u32, wparam: usize, lparam: isize) -> isize;
         pub fn ScreenToClient(hwnd: *mut c_void, pt: *mut Point) -> i32;
         pub fn ClientToScreen(hwnd: *mut c_void, pt: *mut Point) -> i32;
@@ -359,7 +360,8 @@ pub fn client_to_screen(_hwnd: u32, _x: i32, _y: i32) -> Option<(i32, i32)> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum InputMode {
-    /// 自动：先试窗口消息（不动鼠标），棋盘无反应则降级为系统输入。
+    /// 自动：先试后台消息（渲染子窗口，不动鼠标不抢焦点）→ 触摸注入
+    /// （不动鼠标但需前台）→ 系统输入（动鼠标）。
     Auto,
     /// 仅用窗口消息（`SendMessage`）—— **完全不移动鼠标指针**。
     ///
@@ -477,6 +479,61 @@ pub fn post_click(_hwnd: u32, _client_x: i32, _client_y: i32) -> bool {
     false
 }
 
+/// 找 Chromium 的渲染子窗口 `Chrome_RenderWidgetHostHWND`。
+///
+/// Chromium 真正接收鼠标输入的是这个子窗口，不是顶层 `Chrome_WidgetWin_0`。
+/// 对**顶层**发窗口消息无效，不代表对渲染子窗口无效 —— 后台点击（不动鼠标、
+/// 不抢焦点）的唯一希望就在它身上。
+#[cfg(target_os = "windows")]
+fn find_render_child(hwnd: u32) -> Option<u32> {
+    const CLASS: &[u16] = &[0x0043, 0x0068, 0x0072, 0x006F, 0x006D, 0x0065, 0x005F,
+        0x0052, 0x0065, 0x006E, 0x0064, 0x0065, 0x0072, 0x0057, 0x0069, 0x0064,
+        0x0067, 0x0065, 0x0074, 0x0048, 0x006F, 0x0073, 0x0074, 0x0048, 0x0057,
+        0x004E, 0x0044, 0x0000]; // "Chrome_RenderWidgetHostHWND\0"
+    let child = unsafe {
+        ffi::FindWindowExW(
+            hwnd as *mut std::ffi::c_void,
+            std::ptr::null_mut(),
+            CLASS.as_ptr(),
+            std::ptr::null(),
+        )
+    };
+    if child.is_null() {
+        None
+    } else {
+        Some(child as u32)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn find_render_child(_hwnd: u32) -> Option<u32> {
+    None
+}
+
+/// 后台点击：向渲染子窗口投递鼠标消息。**不移动鼠标指针、不抢焦点**。
+///
+/// 传入的坐标是顶层窗口客户区坐标；内部换算到子窗口客户区再投递。
+/// 返回 false 表示没有渲染子窗口（非 Chromium 窗口），调用方自行降级。
+#[cfg(target_os = "windows")]
+pub fn post_click_background(hwnd: u32, client_x: i32, client_y: i32) -> bool {
+    let Some(child) = find_render_child(hwnd) else {
+        return false;
+    };
+    // 顶层客户区 → 屏幕 → 子窗口客户区（子窗口原点未必与顶层重合，交给系统换算）
+    let Some((sx, sy)) = client_to_screen(hwnd, client_x, client_y) else {
+        return false;
+    };
+    let Some((cx, cy)) = screen_to_client(child, sx, sy) else {
+        return false;
+    };
+    post_click(child, cx, cy)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn post_click_background(_hwnd: u32, _client_x: i32, _client_y: i32) -> bool {
+    false
+}
+
 /// 点击屏幕坐标，**点完把鼠标指针放回原处**。
 ///
 /// 系统输入方式无法避免移动指针，但可以"用完即还"，用户基本不被打断。
@@ -546,6 +603,9 @@ pub fn play_move(
 ) -> bool {
     match mode {
         PlayMode::Click => match input {
+            // Message / Auto：后台点击 —— 向 Chromium 渲染子窗口投递鼠标消息，
+            // 不移动鼠标指针、不抢焦点。对顶层窗口发消息无效，但对渲染子窗口
+            // 未必（Chromium 的输入汇点就是它）。未生效时由 worker 重试降级。
             InputMode::Message | InputMode::Auto => {
                 let Some((fcx, fcy)) = map.board_to_client(camp, from.0, from.1) else {
                     return false;
@@ -553,24 +613,11 @@ pub fn play_move(
                 let Some((tcx, tcy)) = map.board_to_client(camp, to.0, to.1) else {
                     return false;
                 };
-                if !post_click(map.hwnd, fcx, fcy) {
+                if !post_click_background(map.hwnd, fcx, fcy) {
                     return false;
                 }
                 sleep(Duration::from_millis(220));
-                post_click(map.hwnd, tcx, tcy)
-            }
-            InputMode::SendInput => {
-                let Some((fx, fy)) = map.board_to_screen(camp, from.0, from.1) else {
-                    return false;
-                };
-                let Some((tx, ty)) = map.board_to_screen(camp, to.0, to.1) else {
-                    return false;
-                };
-                if !click_at_restoring(fx, fy) {
-                    return false;
-                }
-                sleep(Duration::from_millis(220));
-                click_at_restoring(tx, ty)
+                post_click_background(map.hwnd, tcx, tcy)
             }
             InputMode::Touch => {
                 let Some((fx, fy)) = map.board_to_screen(camp, from.0, from.1) else {
@@ -584,6 +631,19 @@ pub fn play_move(
                 }
                 sleep(Duration::from_millis(220));
                 touch_tap(tx, ty)
+            }
+            InputMode::SendInput => {
+                let Some((fx, fy)) = map.board_to_screen(camp, from.0, from.1) else {
+                    return false;
+                };
+                let Some((tx, ty)) = map.board_to_screen(camp, to.0, to.1) else {
+                    return false;
+                };
+                if !click_at_restoring(fx, fy) {
+                    return false;
+                }
+                sleep(Duration::from_millis(220));
+                click_at_restoring(tx, ty)
             }
         },
         PlayMode::Drag => {
